@@ -1,0 +1,278 @@
+"""데이터 소스 어댑터 모듈
+
+FRED, BLS, BEA 등 공공 API를 통한 데이터 수집을 담당하는 어댑터 구현.
+재시도/백오프 로직과 Parquet 저장 기능을 포함.
+
+Example:
+    >>> from data_sources import FREDSource
+    >>> fred = FREDSource(api_key="your_key")
+    >>> df = fred.fetch(["DGS10", "VIXCLS"], start=date(2020,1,1), end=date(2023,12,31))
+"""
+
+import os
+import time
+from datetime import date, datetime
+from pathlib import Path
+from typing import Dict, Iterable, Optional, Protocol, Any, List
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import requests
+from structlog import get_logger
+
+# 구조화 로깅
+logger = get_logger()
+
+
+class DataSource(Protocol):
+    """데이터 소스 인터페이스 프로토콜"""
+    name: str
+    
+    def fetch(self, series: Iterable[str], start: date, end: date, **kw: Any) -> pd.DataFrame:
+        """시계열 데이터 가져오기
+        
+        Args:
+            series: 시리즈 ID 목록
+            start: 시작일
+            end: 종료일
+            **kw: 추가 파라미터
+            
+        Returns:
+            DataFrame with columns: series_id, value, realtime_start, realtime_end
+            Index: date
+        """
+        ...
+
+
+class FREDSource:
+    """FRED(Federal Reserve Economic Data) API 어댑터
+    
+    FRED API를 통해 경제 시계열 데이터를 수집하고 Parquet 형식으로 저장.
+    재시도 로직과 백오프를 포함하여 안정적인 데이터 수집 보장.
+    """
+    
+    name = "fred"
+    BASE_URL = "https://api.stlouisfed.org/fred"
+    
+    def __init__(
+        self, 
+        api_key: Optional[str] = None, 
+        cache_dir: Optional[Path] = None,
+        max_retries: int = 3,
+        backoff_factor: float = 1.0
+    ):
+        """
+        Args:
+            api_key: FRED API 키 (환경변수 FRED_API_KEY 사용 가능)
+            cache_dir: 캐시 디렉토리 경로
+            max_retries: 최대 재시도 횟수
+            backoff_factor: 재시도 간격 증가율
+        """
+        self.api_key = api_key or os.environ.get("FRED_API_KEY")
+        if not self.api_key:
+            raise ValueError("FRED API key required. Set FRED_API_KEY env var or pass api_key")
+        
+        self.cache_dir = cache_dir or Path("data/raw/fred")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        
+        logger.info("FRED 소스 초기화", cache_dir=str(self.cache_dir))
+    
+    def fetch(
+        self, 
+        series: Iterable[str], 
+        start: date, 
+        end: date, 
+        use_cache: bool = True,
+        **kw: Any
+    ) -> pd.DataFrame:
+        """FRED에서 시계열 데이터 가져오기
+        
+        Args:
+            series: FRED 시리즈 ID 목록 (예: ["DGS10", "VIXCLS"])
+            start: 시작일
+            end: 종료일
+            use_cache: 캐시 사용 여부
+            
+        Returns:
+            통합된 DataFrame (인덱스: date, 컬럼: series_id, value, realtime_start, realtime_end)
+        """
+        all_data = []
+        
+        for series_id in series:
+            logger.info("시리즈 수집 시작", series_id=series_id, start=str(start), end=str(end))
+            
+            # 캐시 확인
+            if use_cache:
+                cached_df = self._load_cache(series_id, start, end)
+                if cached_df is not None:
+                    all_data.append(cached_df)
+                    continue
+            
+            # API 호출
+            df = self._fetch_series(series_id, start, end)
+            
+            # 캐시 저장
+            if df is not None and not df.empty:
+                self._save_cache(series_id, df)
+                all_data.append(df)
+        
+        if not all_data:
+            return pd.DataFrame()
+        
+        # 모든 시리즈 통합
+        result = pd.concat(all_data, ignore_index=False)
+        logger.info("데이터 수집 완료", total_rows=len(result))
+        
+        return result
+    
+    def _fetch_series(self, series_id: str, start: date, end: date) -> Optional[pd.DataFrame]:
+        """단일 시리즈 API 호출"""
+        params = {
+            "series_id": series_id,
+            "api_key": self.api_key,
+            "observation_start": start.strftime("%Y-%m-%d"),
+            "observation_end": end.strftime("%Y-%m-%d"),
+            "file_type": "json",
+            "sort_order": "asc"
+        }
+        
+        url = f"{self.BASE_URL}/series/observations"
+        
+        # 재시도 로직
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                # 관측치가 없는 경우
+                if "observations" not in data or not data["observations"]:
+                    logger.warning("관측치 없음", series_id=series_id)
+                    return None
+                
+                # DataFrame 변환
+                df = pd.DataFrame(data["observations"])
+                
+                # 날짜 파싱 및 정리
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.set_index("date")
+                
+                # 값 변환 (결측치 처리)
+                df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                
+                # 필요 컬럼 선택
+                df["series_id"] = series_id
+                df = df[["series_id", "value", "realtime_start", "realtime_end"]]
+                
+                logger.info("시리즈 수집 성공", series_id=series_id, rows=len(df))
+                return df
+                
+            except requests.exceptions.RequestException as e:
+                wait_time = self.backoff_factor * (2 ** attempt)
+                logger.warning(
+                    "API 호출 실패, 재시도 대기", 
+                    series_id=series_id,
+                    attempt=attempt + 1,
+                    wait_time=wait_time,
+                    error=str(e)
+                )
+                
+                if attempt < self.max_retries - 1:
+                    time.sleep(wait_time)
+                else:
+                    logger.error("최대 재시도 횟수 초과", series_id=series_id)
+                    return None
+    
+    def _load_cache(self, series_id: str, start: date, end: date) -> Optional[pd.DataFrame]:
+        """캐시에서 데이터 로드"""
+        cache_file = self.cache_dir / f"{series_id}.parquet"
+        
+        if not cache_file.exists():
+            return None
+        
+        try:
+            df = pd.read_parquet(cache_file)
+            
+            # 요청 기간 필터링
+            mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
+            df_filtered = df[mask]
+            
+            if len(df_filtered) > 0:
+                logger.info("캐시에서 로드", series_id=series_id, rows=len(df_filtered))
+                return df_filtered
+                
+        except Exception as e:
+            logger.warning("캐시 로드 실패", series_id=series_id, error=str(e))
+        
+        return None
+    
+    def _save_cache(self, series_id: str, df: pd.DataFrame) -> None:
+        """캐시에 데이터 저장"""
+        cache_file = self.cache_dir / f"{series_id}.parquet"
+        
+        try:
+            # 기존 캐시와 병합
+            if cache_file.exists():
+                existing_df = pd.read_parquet(cache_file)
+                # 중복 제거하여 병합
+                df = pd.concat([existing_df, df]).drop_duplicates()
+                df = df.sort_index()
+            
+            # Parquet 저장
+            df.to_parquet(cache_file, compression="snappy")
+            logger.info("캐시 저장 완료", series_id=series_id, file=str(cache_file))
+            
+        except Exception as e:
+            logger.error("캐시 저장 실패", series_id=series_id, error=str(e))
+
+
+def persist_parquet(df: pd.DataFrame, path: Path) -> None:
+    """DataFrame을 Parquet 형식으로 저장
+    
+    Args:
+        df: 저장할 DataFrame
+        path: 저장 경로
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, compression="snappy")
+    logger.info("Parquet 저장", path=str(path), rows=len(df))
+
+
+def load_parquet(path: Path) -> pd.DataFrame:
+    """Parquet 파일에서 DataFrame 로드
+    
+    Args:
+        path: 파일 경로
+        
+    Returns:
+        로드된 DataFrame
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"파일을 찾을 수 없음: {path}")
+    
+    df = pd.read_parquet(path)
+    logger.info("Parquet 로드", path=str(path), rows=len(df))
+    return df
+
+
+# 추가 데이터 소스를 위한 스텁
+class BLSSource:
+    """BLS(Bureau of Labor Statistics) API 어댑터 스텁"""
+    name = "bls"
+    
+    def fetch(self, series: Iterable[str], start: date, end: date, **kw: Any) -> pd.DataFrame:
+        """향후 구현 예정"""
+        raise NotImplementedError("BLS 소스는 향후 구현 예정")
+
+
+class BEASource:
+    """BEA(Bureau of Economic Analysis) API 어댑터 스텁"""
+    name = "bea"
+    
+    def fetch(self, series: Iterable[str], start: date, end: date, **kw: Any) -> pd.DataFrame:
+        """향후 구현 예정"""
+        raise NotImplementedError("BEA 소스는 향후 구현 예정")
