@@ -49,6 +49,28 @@ REGIME_COLORS = {
 }
 
 
+# 툴팁 정의
+TOOLTIP_DEFINITIONS = {
+    # Macro tiles
+    "MacroScore": "여러 카테고리의 레벨·모멘텀·가속도를 가중 평균한 합성 점수입니다. +는 우호적, -는 비우호적.",
+    "모멘텀": "최근 변화의 방향과 크기(1차 차분의 표준화).",
+    "Momentum": "최근 변화의 방향과 크기(1차 차분의 표준화).",
+    "가속도": "변화의 변화(2차 차분의 표준화). 추세 강화/둔화 판단.",
+    "Acceleration": "변화의 변화(2차 차분의 표준화). 추세 강화/둔화 판단.",
+
+    # Breadth
+    "MacroBreadth_top50": "상위 50% 분위 이상에 위치한 지표의 비중입니다. 시장·지표의 동조화 정도를 나타냅니다.",
+    "MacroBreadth_top20": "상위 20% 분위 이상에 위치한 지표의 비중입니다.",
+
+    # Indicators
+    "VIXCLS": "S&P 500 옵션 내재변동성(VIX). 향후 30일 변동성 기대.",
+    "TERM_SPREAD": "장단기 금리차(10년물−3개월물). 경기 국면 시그널로 활용.",
+    "DGS10": "미국 10년 만기 국채 금리.",
+    "DGS3MO": "미국 3개월 만기 국채 금리.",
+    "DCOILWTICO": "WTI 원유 가격.",
+    "NFCI": "시카고 연은 금융여건지수. 0보다 크면 긴축, 작으면 완화.",
+}
+
 def render_macro_score_tile(
     score: float,
     momentum: float,
@@ -72,7 +94,8 @@ def render_macro_score_tile(
             label=title,
             value=f"{score:.3f}",
             delta=f"Δ {momentum:.3f}",
-            delta_color="normal" if momentum > 0 else "inverse"
+            delta_color="normal" if momentum > 0 else "inverse",
+            help=TOOLTIP_DEFINITIONS.get(title, "")
         )
         
         # 진행 바
@@ -83,14 +106,16 @@ def render_macro_score_tile(
         st.metric(
             label="모멘텀",
             value=f"{momentum:.3f}",
-            delta=None
+            delta=None,
+            help=TOOLTIP_DEFINITIONS.get("모멘텀", TOOLTIP_DEFINITIONS.get("Momentum", ""))
         )
     
     with col3:
         st.metric(
             label="가속도",
             value=f"{acceleration:.3f}",
-            delta=None
+            delta=None,
+            help=TOOLTIP_DEFINITIONS.get("가속도", TOOLTIP_DEFINITIONS.get("Acceleration", ""))
         )
 
 
@@ -154,7 +179,11 @@ def render_breadth_bar(
             label="변화",
             value=f"{breadth:.1%}",
             delta=f"{breadth_delta:+.1%}",
-            delta_color=delta_color
+            delta_color=delta_color,
+            help=TOOLTIP_DEFINITIONS.get(
+                "MacroBreadth_top50" if "50" in threshold else "MacroBreadth_top20",
+                "브레드스(상위 분위 이상 지표 비중)입니다."
+            )
         )
 
 
@@ -243,7 +272,8 @@ def render_indicator_card(
             st.metric(
                 label="현재 값",
                 value=value_str,
-                delta=f"상위 {percentile:.0%}"
+                delta=f"상위 {percentile:.0%}",
+                help=TOOLTIP_DEFINITIONS.get(name, f"{name} 지표입니다.")
             )
         
         with col2:
@@ -252,7 +282,8 @@ def render_indicator_card(
             st.metric(
                 label="Δ",
                 value=f"{momentum:.3f}",
-                delta=None
+                delta=None,
+                help=TOOLTIP_DEFINITIONS.get("모멘텀", TOOLTIP_DEFINITIONS.get("Momentum", ""))
             )
         
         with col3:
@@ -261,7 +292,8 @@ def render_indicator_card(
             st.metric(
                 label="Δ²",
                 value=f"{acceleration:.3f}",
-                delta=None
+                delta=None,
+                help=TOOLTIP_DEFINITIONS.get("가속도", TOOLTIP_DEFINITIONS.get("Acceleration", ""))
             )
         
         # 미니 차트 (스파크라인)
@@ -532,20 +564,19 @@ def render_auto_summary(
         magnitude = change.get("magnitude", 0)
         context = change.get("context", "")
         
-        # 아이콘 선택
+        # 방향/색상(이모지 제거)
         if direction == "up":
-            icon = "📈"
             color = COLOR_PALETTE["positive"]
+            dir_text = "상승"
         elif direction == "down":
-            icon = "📉"
             color = COLOR_PALETTE["negative"]
+            dir_text = "하락"
         else:
-            icon = "➡️"
             color = COLOR_PALETTE["neutral"]
+            dir_text = "변화"
         
         # 변화 설명 생성
-        change_text = f"{icon} **{indicator}**가 {abs(magnitude):.1f}% "
-        change_text += "상승" if direction == "up" else "하락"
+        change_text = f"**{indicator}**가 {abs(magnitude):.1f}% {dir_text}"
         
         if context:
             change_text += f" ({context})"
@@ -564,18 +595,17 @@ def create_dashboard_layout() -> Tuple[Any, Any]:
     """
     st.set_page_config(
         page_title="S&P 리스크·신호 집계판",
-        page_icon="📊",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
     # 헤더
-    st.title("🎯 S&P 500 리스크·신호 집계판 + 확률 콘 대시보드")
+    st.title("S&P 500 리스크·신호 집계판 + 확률 콘 대시보드")
     
     # 최종 업데이트 시간
     st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # 탭 생성
-    tab_a, tab_b = st.tabs(["📊 매크로 시황 요약", "📈 S&P 500 팬 차트"])
+    tab_a, tab_b = st.tabs(["매크로 시황 요약", "S&P 500 팬 차트"])
     
     return tab_a, tab_b

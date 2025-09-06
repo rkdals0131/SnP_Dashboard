@@ -363,6 +363,7 @@ def validate(
     
     # 스냅샷 선택
     model_path: Path
+    snapshot_id: str
     if not snapshot:
         # 가장 최근 스냅샷 사용
         model_dirs = sorted(MODELS_DIR.glob("*/"))
@@ -376,10 +377,13 @@ def validate(
         snap_path = Path(snapshot)
         if snap_path.is_file():
             model_path = snap_path
+            snapshot_id = snap_path.parent.name
         elif snap_path.is_dir():
             model_path = snap_path / "models.pkl"
+            snapshot_id = snap_path.name
         else:
             model_path = MODELS_DIR / snapshot / "models.pkl"
+            snapshot_id = snapshot
 
     console.print(f"스냅샷 파일: {model_path}")
     
@@ -444,7 +448,8 @@ def validate(
             progress.update(task, completed=1)
             
             # 결과 저장
-            eval_dir = EVALUATIONS_DIR / snapshot
+            # snapshot이 None인 경우도 안전하게 디렉토리 구성
+            eval_dir = EVALUATIONS_DIR / snapshot_id
             eval_dir.mkdir(parents=True, exist_ok=True)
             
             # 리포트 생성

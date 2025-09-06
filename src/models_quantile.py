@@ -289,8 +289,13 @@ def predict_fanchart(
     fancharts = {}
     
     for horizon, model in models.items():
+        # 입력 특성 정렬/보정: 학습시 특성 목록에 맞춰 컬럼 정렬, 결측은 0으로 대체
+        X_in = X_t
+        if isinstance(X_t, pd.DataFrame) and getattr(model, "feature_names", None):
+            X_in = X_t.reindex(columns=model.feature_names).fillna(0.0)
+
         # 기본 예측
-        predictions = model.predict(X_t)
+        predictions = model.predict(X_in)
         
         # VIX 앵커링 (단기에만 적용)
         if vix_current and horizon in blend_config:

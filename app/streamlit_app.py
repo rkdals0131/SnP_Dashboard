@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import date
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,14 @@ from structlog import get_logger
 
 from src.models_quantile import load_models, predict_fanchart
 from src.scenarios import apply_shocks, compute_contributions, DEFAULT_SCENARIOS
+from src.data_sources import FREDSource
+from src.align_vintage import (
+    create_month_end_calendar,
+    build_master_panel,
+    apply_publication_delays,
+    PUBLICATION_RULES,
+)
+from src.features import build_feature_panel
 from src.viz import (
     create_dashboard_layout,
     render_macro_score_tile,
@@ -70,6 +79,60 @@ def _load_prices() -> Optional[pd.DataFrame]:
     return None
 
 
+def _default_series_for_tab_a() -> List[str]:
+    # CLI의 기본 셋과 정합(필요 핵심 위주)
+    return [
+        "DGS10", "DGS3MO", "DGS2",  # 국채 수익률
+        "VIXCLS",                      # VIX
+        "SP500",                       # S&P 500
+        "DCOILWTICO",                  # WTI 유가
+        "BAA", "BAMLH0A0HYM2",       # 크레딧 스프레드
+        "UNRATE",                      # 실업률
+        "CPIAUCSL", "CPILFESL",      # 인플레이션
+        "NFCI"                         # 금융여건 지수
+    ]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _build_live_features_for_tab_a(
+    start: str = "2000-01-01",
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """FRED에서 실시간 수집 → 정합/빈티지 → 피처 계산(탭 A용)
+
+    Notes:
+        - 5분 캐시 적용(ttl=300)
+        - 환경변수 FRED_API_KEY 필요
+    """
+    # 기간 설정
+    end_str = end or date.today().strftime("%Y-%m-%d")
+
+    # 데이터 수집(캐시 저장 병행)
+    fred = FREDSource()  # env FRED_API_KEY 사용
+    series_list = _default_series_for_tab_a()
+    _ = fred.fetch(series_list, pd.to_datetime(start).date(), pd.to_datetime(end_str).date())
+
+    # 원천 경로 구성(방금 저장된 캐시 사용)
+    raw_dir = Path("data/raw/fred")
+    raw_paths: Dict[str, Path] = {}
+    for sid in series_list:
+        p = raw_dir / f"{sid}.parquet"
+        if p.exists():
+            raw_paths[sid] = p
+
+    if not raw_paths:
+        raise RuntimeError("원천 데이터를 찾을 수 없습니다(FRED/API/네트워크 확인).")
+
+    # 캘린더 → 마스터 패널 → 발표 지연 적용
+    calendar = create_month_end_calendar(start, end_str)
+    master_panel = build_master_panel(raw_paths, calendar)
+    vintage_panel = apply_publication_delays(master_panel, PUBLICATION_RULES)
+
+    # 피처 패널 구축(레벨/Δ/Δ²/분위/브레드스/레짐)
+    feature_panel = build_feature_panel(vintage_panel)
+    return feature_panel
+
+
 def _list_model_snapshots() -> List[str]:
     if not MODELS_DIR.exists():
         return []
@@ -82,19 +145,41 @@ def _latest_snapshot() -> Optional[str]:
 
 
 def _select_feature_row(features: pd.DataFrame) -> pd.Series:
-    # 마지막 유효 행을 선택
-    return features.iloc[-1].dropna()
+    """마지막 유효 관측치를 선택
+
+    월말 빈티지 처리로 인해 최신 행에 결측이 많을 수 있으므로
+    시계열 방향으로 forward-fill 후 마지막 행을 사용합니다.
+    모든 값이 결측인 경우를 대비해 back-fill도 시도합니다.
+    """
+    if features.empty:
+        return pd.Series(dtype=float)
+    filled = features.ffill().bfill()
+    return filled.iloc[-1]
 
 
 def main() -> None:
     tab_a, tab_b = create_dashboard_layout()
 
-    features = _load_features()
+    # 사이드바: 설정/시나리오 및 탭 A 새로고침
+    with st.sidebar:
+        st.header("설정 및 시나리오")
+        refresh = st.button("탭 A 데이터 새로고침")
+        if refresh:
+            st.cache_data.clear()
+
+    # 데이터 준비(탭 A: 우선 실시간, 실패 시 파일)
+    features_live: Optional[pd.DataFrame] = None
+    features_file = _load_features()
     prices = _load_prices()
+
+    try:
+        features_live = _build_live_features_for_tab_a()
+    except Exception as e:
+        logger.warning("라이브 피처 생성 실패, 파일로 대체", error=str(e))
 
     # 사이드바: 모델 스냅샷 선택 및 시나리오 입력
     with st.sidebar:
-        st.header("⚙️ 설정 및 시나리오")
+        # 위에서 헤더/버튼 렌더링됨
         snaps = _list_model_snapshots()
         default_snap = _latest_snapshot()
         snapshot = st.selectbox("모델 스냅샷", options=["(없음)"] + snaps, index=(snaps.index(default_snap) + 1) if default_snap else 0)
@@ -114,9 +199,15 @@ def main() -> None:
     # 탭 A — 매크로 시황 요약
     with tab_a:
         st.subheader("매크로 시황 요약")
+        # 우선순위: 라이브 → 파일 → 경고
+        features = features_live if features_live is not None else features_file
         if features is None:
-            st.warning("피처 파일을 찾을 수 없습니다. 먼저 CLI로 ingest ➜ features를 실행하세요.")
+            st.warning("실시간/파일 데이터가 없습니다. FRED_API_KEY 설정 후 재시도하거나 CLI로 ingest ➜ features를 실행하세요.")
         else:
+            if features_live is not None:
+                st.caption("데이터 소스: 실시간(FRED, 5분 캐시)")
+            else:
+                st.caption("데이터 소스: 파일(features.parquet)")
             # 최근 값 기준 간단 요약
             last_row = _select_feature_row(features)
             score = float(last_row.get("MacroScore", 0))
@@ -179,6 +270,11 @@ def main() -> None:
 
         models = load_models(model_path)
 
+        # 모델이 비어있는 경우 처리
+        if not models:
+            st.warning("선택한 스냅샷에 학습된 모델이 없습니다. 충분한 데이터로 'train'을 다시 실행하세요.")
+            return
+
         # 현재 특성행과 시나리오 적용
         x_t = _select_feature_row(features)
 
@@ -199,8 +295,15 @@ def main() -> None:
         # 팬차트 생성(전 기간)
         fancharts = predict_fanchart(models, x_shocked, vix_current=vix_val)
 
-        # 1M 차트 우선 표시
-        horizon = st.selectbox("예측 기간", options=list(fancharts.keys()), index=0)
+        # 팬차트가 비어있는 경우 처리
+        if not fancharts:
+            st.warning("예측 결과가 없습니다. 모델 또는 입력 데이터를 확인하세요.")
+            return
+
+        # 1M 우선 선택(있으면), 없으면 첫 항목
+        keys = list(fancharts.keys())
+        default_index = keys.index("1M") if "1M" in keys else 0
+        horizon = st.selectbox("예측 기간", options=keys, index=default_index)
         render_fan_chart(fancharts[horizon], prices, current_price, show_history=True)
 
         # 불확실성 게이지(간단): 80% 폭/12M 최근 실현 변동
