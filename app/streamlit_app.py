@@ -18,7 +18,7 @@ from structlog import get_logger
 
 from src.models_quantile import load_models, predict_fanchart
 from src.scenarios import apply_shocks, compute_contributions, DEFAULT_SCENARIOS
-from src.data_sources import FREDSource
+from src.data_sources import FREDSource, FXSource
 from src.align_vintage import (
     create_month_end_calendar,
     build_master_panel,
@@ -32,6 +32,8 @@ from src.viz import (
     render_breadth_bar,
     render_regime_badges,
     render_indicator_card,
+    render_indicator_narratives,
+    render_ai_one_liner,
     render_fan_chart,
     render_uncertainty_gauge,
     render_contribution_chart,
@@ -86,10 +88,15 @@ def _default_series_for_tab_a() -> List[str]:
         "VIXCLS",                      # VIX
         "SP500",                       # S&P 500
         "DCOILWTICO",                  # WTI 유가
+        "GOLDAMGBD228NLBM",            # 금 가격(LBMA AM, USD)
         "BAA", "BAMLH0A0HYM2",       # 크레딧 스프레드
         "UNRATE",                      # 실업률
         "CPIAUCSL", "CPILFESL",      # 인플레이션
-        "NFCI"                         # 금융여건 지수
+        "NFCI",                        # 금융여건 지수
+        "FEDFUNDS",                    # 연방기금금리(월)
+        "PAYEMS", "CIVPART",          # 고용/참가율
+        "JTSJOL",                      # 구인
+        "DTWEXBGS"                     # 달러지수(광의)
     ]
 
 
@@ -109,14 +116,24 @@ def _build_live_features_for_tab_a(
 
     # 데이터 수집(캐시 저장 병행)
     fred = FREDSource()  # env FRED_API_KEY 사용
+    fx = FXSource()
     series_list = _default_series_for_tab_a()
     _ = fred.fetch(series_list, pd.to_datetime(start).date(), pd.to_datetime(end_str).date())
+    # 환율 (무료/무키)
+    fx_pairs = ["USDKRW", "USDJPY", "USDEUR"]
+    _ = fx.fetch(fx_pairs, pd.to_datetime(start).date(), pd.to_datetime(end_str).date())
 
     # 원천 경로 구성(방금 저장된 캐시 사용)
     raw_dir = Path("data/raw/fred")
     raw_paths: Dict[str, Path] = {}
     for sid in series_list:
         p = raw_dir / f"{sid}.parquet"
+        if p.exists():
+            raw_paths[sid] = p
+    # FX 원천 추가
+    raw_fx_dir = Path("data/raw/fx")
+    for sid in fx_pairs:
+        p = raw_fx_dir / f"{sid}.parquet"
         if p.exists():
             raw_paths[sid] = p
 
@@ -191,6 +208,7 @@ def main() -> None:
             "DGS3MO": st.slider("3M UST (bp)", -100, 100, 0) / 100.0,
             "VIXCLS": st.slider("VIX (포인트)", -20, 20, 0),
             "DCOILWTICO": st.slider("WTI (달러)", -20, 20, 0),
+            "GOLDAMGBD228NLBM": st.slider("Gold (달러/oz)", -200, 200, 0),
             "NFCI": st.slider("NFCI", -1, 1, 0),
             "CPIAUCSL": st.slider("CPI 서프라이즈", -1, 1, 0),
         }
@@ -228,7 +246,10 @@ def main() -> None:
             # 지표 카드(샘플)
             st.markdown("---")
             st.subheader("핵심 지표")
-            key_inds = ["VIXCLS", "DGS10", "DGS3MO", "TERM_SPREAD", "NFCI", "DCOILWTICO"]
+            key_inds = [
+                "VIXCLS", "DGS10", "DGS3MO", "TERM_SPREAD",
+                "NFCI", "DCOILWTICO", "GOLDAMGBD228NLBM", "USDKRW", "UNRATE", "CPIAUCSL"
+            ]
             cols = st.columns(3)
             for i, ind in enumerate(key_inds):
                 if ind in features.columns:
@@ -250,6 +271,20 @@ def main() -> None:
                     "context": "브레드스 임계 변화"
                 })
             render_auto_summary(changes)
+
+            # 지표 자연어 설명 섹션
+            st.markdown("---")
+            st.subheader("지표 설명(자연어)")
+            render_indicator_narratives(key_inds, last_row)
+
+            # 선택: AI 한 줄 요약(Gemini API Key가 있으면)
+            with st.expander("AI 한 줄 요약 (옵션)"):
+                use_ai = st.checkbox(
+                    "Gemini 요약 사용",
+                    value=False,
+                    help="GEMINI_API_KEY 또는 GOOGLE_API_KEY 설정 및 google-generativeai 패키지 설치 필요.")
+                if use_ai:
+                    render_ai_one_liner(last_row, key_inds)
 
     # 탭 B — 팬 차트
     with tab_b:

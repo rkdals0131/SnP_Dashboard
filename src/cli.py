@@ -65,6 +65,7 @@ DEFAULT_SERIES = [
     "VIXCLS",  # VIX
     "SP500",  # S&P 500
     "DCOILWTICO",  # WTI 유가
+    "GOLDAMGBD228NLBM",  # 금 가격(LBMA AM, USD)
     "BAA", "BAMLH0A0HYM2",  # 크레딧 스프레드
     "UNRATE",  # 실업률
     "CPIAUCSL", "CPILFESL",  # 인플레이션

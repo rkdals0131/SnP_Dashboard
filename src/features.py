@@ -29,7 +29,8 @@ CATEGORY_MAPPING = {
     "financial_conditions": ["NFCI", "ANFCI", "VIX"],
     "credit": ["BAA", "BAMLH0A0HYM2", "CREDIT_SPREAD"],
     "volatility": ["VIXCLS", "SKEW", "MOVE"],
-    "commodities": ["DCOILWTICO", "DJP", "DXY"]
+    "commodities": ["DCOILWTICO", "GOLDAMGBD228NLBM", "DJP"],
+    "fx": ["USDKRW", "USDJPY", "USDEUR", "DTWEXBGS"]
 }
 
 # 기본 가중치

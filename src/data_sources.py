@@ -13,7 +13,7 @@ import os
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Protocol, Any, List
+from typing import Dict, Iterable, Optional, Protocol, Any, List, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -276,3 +276,150 @@ class BEASource:
     def fetch(self, series: Iterable[str], start: date, end: date, **kw: Any) -> pd.DataFrame:
         """향후 구현 예정"""
         raise NotImplementedError("BEA 소스는 향후 구현 예정")
+
+
+class FXSource:
+    """무료 환율 API 어댑터 (exchangerate.host)
+
+    - 키 불필요, 무료로 일별 시계열(timeseries) 제공
+    - 지원 형식: 'USDKRW', 'USDJPY', 'USDEUR' 등 기본통화USD 페어
+    - 스키마는 FRED과 동일하게 통일(index=date, columns=[series_id,value,realtime_start,realtime_end])
+    """
+
+    name = "fx"
+    BASE_URL = "https://api.exchangerate.host/timeseries"
+
+    def __init__(
+        self,
+        cache_dir: Optional[Path] = None,
+        max_retries: int = 3,
+        backoff_factor: float = 1.0,
+    ) -> None:
+        self.cache_dir = cache_dir or Path("data/raw/fx")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        logger.info("FX 소스 초기화", cache_dir=str(self.cache_dir))
+
+    def fetch(
+        self,
+        series: Iterable[str],
+        start: date,
+        end: date,
+        use_cache: bool = True,
+        base: str = "USD",
+        **kw: Any,
+    ) -> pd.DataFrame:
+        all_data: List[pd.DataFrame] = []
+
+        for sid in series:
+            base_ccy, quote_ccy = self._parse_pair(sid, default_base=base)
+            cache_df = self._load_cache(sid, start, end) if use_cache else None
+            if cache_df is not None:
+                all_data.append(cache_df)
+                continue
+
+            df = self._fetch_pair_series(sid, base_ccy, quote_ccy, start, end)
+            if df is not None and not df.empty:
+                self._save_cache(sid, df)
+                all_data.append(df)
+
+        if not all_data:
+            return pd.DataFrame()
+
+        result = pd.concat(all_data, ignore_index=False)
+        logger.info("FX 데이터 수집 완료", total_rows=len(result))
+        return result
+
+    def _parse_pair(self, pair: str, default_base: str = "USD") -> Tuple[str, str]:
+        pair = pair.upper().replace("/", "")
+        if len(pair) == 6:
+            return pair[:3], pair[3:]
+        if pair.startswith(default_base) and len(pair) > 3:
+            return default_base, pair[3:]
+        # 기본: USD{XXX}
+        return default_base, pair[-3:]
+
+    def _fetch_pair_series(
+        self,
+        series_id: str,
+        base_ccy: str,
+        quote_ccy: str,
+        start: date,
+        end: date,
+    ) -> Optional[pd.DataFrame]:
+        params = {
+            "start_date": str(start),
+            "end_date": str(end),
+            "base": base_ccy,
+            "symbols": quote_ccy,
+        }
+
+        for attempt in range(self.max_retries):
+            try:
+                r = requests.get(self.BASE_URL, params=params, timeout=20)
+                r.raise_for_status()
+                data = r.json()
+                if not data.get("rates"):
+                    logger.warning("FX 관측치 없음", series_id=series_id)
+                    return None
+
+                records = []
+                for d, rates in data["rates"].items():
+                    val = rates.get(quote_ccy)
+                    if val is None:
+                        continue
+                    records.append(
+                        {
+                            "date": pd.to_datetime(d),
+                            "series_id": series_id.upper(),
+                            "value": float(val),
+                            "realtime_start": d,
+                            "realtime_end": d,
+                        }
+                    )
+
+                df = pd.DataFrame.from_records(records).set_index("date").sort_index()
+                logger.info("FX 시리즈 수집 성공", series_id=series_id, rows=len(df))
+                return df
+            except requests.exceptions.RequestException as e:
+                wait_time = self.backoff_factor * (2 ** attempt)
+                logger.warning(
+                    "FX API 호출 실패, 재시도 대기",
+                    series_id=series_id,
+                    attempt=attempt + 1,
+                    wait_time=wait_time,
+                    error=str(e),
+                )
+                if attempt < self.max_retries - 1:
+                    time.sleep(wait_time)
+                else:
+                    logger.error("FX 최대 재시도 초과", series_id=series_id)
+                    return None
+
+    def _load_cache(self, series_id: str, start: date, end: date) -> Optional[pd.DataFrame]:
+        cache_file = self.cache_dir / f"{series_id}.parquet"
+        if not cache_file.exists():
+            return None
+        try:
+            df = pd.read_parquet(cache_file)
+            mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
+            df_filtered = df[mask]
+            if len(df_filtered) > 0:
+                logger.info("FX 캐시에서 로드", series_id=series_id, rows=len(df_filtered))
+                return df_filtered
+        except Exception as e:
+            logger.warning("FX 캐시 로드 실패", series_id=series_id, error=str(e))
+        return None
+
+    def _save_cache(self, series_id: str, df: pd.DataFrame) -> None:
+        cache_file = self.cache_dir / f"{series_id}.parquet"
+        try:
+            if cache_file.exists():
+                existing_df = pd.read_parquet(cache_file)
+                df = pd.concat([existing_df, df]).drop_duplicates()
+                df = df.sort_index()
+            df.to_parquet(cache_file, compression="snappy")
+            logger.info("FX 캐시 저장 완료", series_id=series_id, file=str(cache_file))
+        except Exception as e:
+            logger.error("FX 캐시 저장 실패", series_id=series_id, error=str(e))

@@ -30,6 +30,11 @@ PUBLICATION_RULES = {
     "VIXCLS": "1BD",  # VIX 종가
     "SP500": "1BD",  # S&P 500 지수
     "DCOILWTICO": "1BD",  # WTI 유가
+    "GOLDAMGBD228NLBM": "1BD",  # 금 가격 (LBMA AM, USD)
+    # 환율(일별)
+    "USDKRW": "1BD",
+    "USDJPY": "1BD",
+    "USDEUR": "1BD",
     
     # 주간 지표: 공표 주의 금요일 T+1 영업일
     "ICSA": "6D",  # 신규 실업수당 청구
@@ -41,6 +46,11 @@ PUBLICATION_RULES = {
     "UNRATE": "1M+3BD",  # 실업률
     "BAA": "1M+3BD",  # Moody's BAA 스프레드
     "BAMLH0A0HYM2": "1M+3BD",  # High Yield OAS
+    "FEDFUNDS": "1M+3BD",  # 연방기금 금리(월)
+    "PAYEMS": "1M+3BD",  # 비농업 신규고용
+    "CIVPART": "1M+3BD",  # 경제활동참가율
+    "JTSJOL": "1M+3BD",  # 구인건수(JOLTS)
+    "DTWEXBGS": "1M+3BD",  # Broad 달러지수
     
     # 분기 지표: 다음 분기 20영업일
     "GDP": "1Q+20BD",  # GDP

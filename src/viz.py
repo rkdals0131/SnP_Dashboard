@@ -68,7 +68,19 @@ TOOLTIP_DEFINITIONS = {
     "DGS10": "미국 10년 만기 국채 금리.",
     "DGS3MO": "미국 3개월 만기 국채 금리.",
     "DCOILWTICO": "WTI 원유 가격.",
+    "GOLDAMGBD228NLBM": "금 가격(LBMA 오전 고시, 달러/온스).",
     "NFCI": "시카고 연은 금융여건지수. 0보다 크면 긴축, 작으면 완화.",
+    # Labor / Inflation / Policy
+    "UNRATE": "실업률(%) — 노동시장 상황.",
+    "PAYEMS": "비농업 신규고용(천 명).",
+    "CIVPART": "경제활동참가율(%).",
+    "FEDFUNDS": "연방기금 금리(월 평균).",
+    "JTSJOL": "구인건수(JOLTS, 백만).",
+    # FX
+    "USDKRW": "미달러/원 환율(USDKRW). 값 상승=원화 약세.",
+    "USDJPY": "미달러/엔 환율(USDJPY). 값 상승=엔화 약세.",
+    "USDEUR": "미달러/유로 환율(USDEUR). 값 상승=유로 약세.",
+    "DTWEXBGS": "미 달러(광의) 무역가중지수.",
 }
 
 def render_macro_score_tile(
@@ -299,6 +311,170 @@ def render_indicator_card(
         # 미니 차트 (스파크라인)
         # TODO: 실제 히스토리 데이터로 교체
         st.markdown("---")
+
+
+def _classify_percentile(pct: float) -> str:
+    if np.isnan(pct):
+        return "자료부족"
+    if pct >= 0.8:
+        return "매우 높음"
+    if pct >= 0.6:
+        return "높음"
+    if pct <= 0.2:
+        return "매우 낮음"
+    if pct <= 0.4:
+        return "낮음"
+    return "중립"
+
+
+def generate_indicator_narrative(
+    name: str,
+    last_row: pd.Series,
+    units: Optional[Dict[str, str]] = None
+) -> str:
+    """단일 지표에 대한 자연어 설명 생성(규칙 기반)
+
+    - 현재 값과 10년 백분위 수준
+    - 최근 변화(Δ) 방향
+    - 가속도(Δ²) 유무
+    """
+    units = units or {}
+    level = last_row.get(name, np.nan)
+    pctscore = last_row.get(f"{name}_pctscore", np.nan)
+    mom = last_row.get(f"{name}_d1", np.nan)
+    acc = last_row.get(f"{name}_d2", np.nan)
+
+    pct = (pctscore + 1) / 2 if not pd.isna(pctscore) else np.nan
+    lvl_str = f"{level:.2f}{units.get(name, '')}" if not pd.isna(level) else "N/A"
+    pct_str = f"{(pct if not pd.isna(pct) else 0):.0%}" if not pd.isna(pct) else "자료부족"
+    pct_bucket = _classify_percentile(pct) if not pd.isna(pct) else "자료부족"
+
+    direction = "상승" if (not pd.isna(mom) and mom > 0) else "하락" if (not pd.isna(mom) and mom < 0) else "변화없음"
+    accel = (
+        "가속" if (not pd.isna(acc) and acc > 0) else
+        "감속" if (not pd.isna(acc) and acc < 0) else
+        "안정"
+    )
+
+    return f"{name}: 현재 {lvl_str}, 10년 대비 {pct_str}({pct_bucket}). 최근 {direction}, {accel} 경향."
+
+
+def render_indicator_narratives(
+    indicators: List[str],
+    last_row: pd.Series,
+    units: Optional[Dict[str, str]] = None,
+) -> None:
+    """지표별 규칙 기반 자연어 요약을 리스트로 렌더링"""
+    for ind in indicators:
+        if ind in last_row.index or f"{ind}_pctscore" in last_row.index:
+            st.markdown(f"- {generate_indicator_narrative(ind, last_row, units)}")
+
+
+def render_ai_one_liner(
+    last_row: pd.Series,
+    indicators: List[str],
+    model: Optional[str] = None,
+    max_tokens: int = 60
+) -> None:
+    """Gemini를 사용한 한 줄 요약(옵션)
+
+    - 환경변수 GEMINI_API_KEY 또는 GOOGLE_API_KEY가 필요하며, `google-generativeai` 패키지를 사용합니다.
+    - 사용 불가 시 규칙 기반 한 줄 요약으로 대체합니다.
+    """
+    # 준비: 컨텍스트 추출
+    ctx = []
+    for ind in indicators:
+        level = last_row.get(ind, np.nan)
+        pctscore = last_row.get(f"{ind}_pctscore", np.nan)
+        mom = last_row.get(f"{ind}_d1", np.nan)
+        acc = last_row.get(f"{ind}_d2", np.nan)
+        pct = (pctscore + 1) / 2 if not pd.isna(pctscore) else np.nan
+        ctx.append(
+            {
+                "name": ind,
+                "level": None if pd.isna(level) else float(level),
+                "pct": None if pd.isna(pct) else float(pct),
+                "d1": None if pd.isna(mom) else float(mom),
+                "d2": None if pd.isna(acc) else float(acc),
+            }
+        )
+
+    # 규칙 기반 백업 문장
+    def fallback_line() -> str:
+        parts = []
+        for c in ctx[:5]:
+            if c["pct"] is None:
+                continue
+            bucket = _classify_percentile(c["pct"]) if c["pct"] is not None else "자료부족"
+            dir_txt = "↑" if (c["d1"] or 0) > 0 else "↓" if (c["d1"] or 0) < 0 else "→"
+            parts.append(f"{c['name']} {bucket}{dir_txt}")
+        return " / ".join(parts) or "핵심 지표 변화가 제한적입니다."
+
+    # Gemini 호출 시도
+    try:
+        import os
+        import google.generativeai as genai  # type: ignore
+
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY/GOOGLE_API_KEY 없음")
+
+        genai.configure(api_key=api_key)
+
+        # 모델 선택: 명시 인자 → 환경변수 → 합리적 기본/폴백
+        env_model = os.getenv("GEMINI_MODEL")
+        candidate_models: List[str] = []
+        if model:
+            candidate_models = [model]
+        elif env_model:
+            candidate_models = [env_model]
+        else:
+            candidate_models = [
+                "gemini-2.5-flash-lite",  # 요청 우선
+                "gemini-2.5-flash",
+                "gemini-2.0-flash-lite",
+                "gemini-2.0-flash",
+                "gemini-1.5-flash-8b",
+                "gemini-1.5-flash",
+            ]
+
+        prompt = (
+            "다음 핵심 지표의 현재 수준(10년 백분위)과 최근 변화 방향을 바탕으로, "
+            "S&P 500에 대한 위험/유동성/물가/성장 환경을 1문장(한국어)으로 중립적으로 요약하세요. "
+            "숫자 나열 대신 '변동성 완화', '달러 강세 지속'처럼 요점만 기술: "
+            f"{ctx}"
+        )
+
+        gen_cfg = genai.GenerationConfig(
+            temperature=0.3,
+            max_output_tokens=max_tokens,
+        )
+
+        last_error: Optional[Exception] = None
+        text_out: Optional[str] = None
+        for m in candidate_models:
+            try:
+                mdl = genai.GenerativeModel(m)
+                resp = mdl.generate_content(prompt, generation_config=gen_cfg)
+                # 일부 SDK 버전은 resp.text, 일부는 candidates[0].content.parts
+                if hasattr(resp, "text") and resp.text:
+                    text_out = resp.text.strip()
+                elif getattr(resp, "candidates", None):
+                    parts = resp.candidates[0].content.parts
+                    text_out = "".join(getattr(p, "text", "") for p in parts).strip()
+                if text_out:
+                    break
+            except Exception as e:  # 다음 후보로 폴백
+                last_error = e
+                continue
+
+        if text_out:
+            st.success(text_out)
+        else:
+            raise RuntimeError(str(last_error) if last_error else "응답 없음")
+
+    except Exception as e:
+        st.info(f"AI 요약 비활성화({e}). 대체 요약: {fallback_line()}")
 
 
 def render_fan_chart(
