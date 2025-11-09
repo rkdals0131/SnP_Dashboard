@@ -763,25 +763,244 @@ def render_auto_summary(
         )
 
 
-def create_dashboard_layout() -> Tuple[Any, Any]:
+def render_candlestick_chart(
+    df: pd.DataFrame,
+    title: str = "S&P 500 실시간 차트",
+    height: int = 600,
+    show_volume: bool = True,
+    show_sma: bool = True,
+    show_bb: bool = False,
+) -> None:
+    """캔들스틱 차트 렌더링
+
+    Args:
+        df: OHLCV 데이터프레임 (컬럼: Open, High, Low, Close, Volume)
+        title: 차트 제목
+        height: 차트 높이
+        show_volume: 거래량 표시 여부
+        show_sma: 이동평균선 표시 여부
+        show_bb: 볼린저 밴드 표시 여부
+    """
+    if df.empty:
+        st.warning("데이터가 없습니다.")
+        return
+
+    # 서브플롯 생성 (가격 + 거래량)
+    rows = 2 if show_volume else 1
+    row_heights = [0.7, 0.3] if show_volume else [1.0]
+
+    fig = make_subplots(
+        rows=rows,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=row_heights,
+        subplot_titles=(title, "거래량") if show_volume else (title,)
+    )
+
+    # 캔들스틱
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name="가격",
+            increasing_line_color=COLOR_PALETTE["positive"],
+            decreasing_line_color=COLOR_PALETTE["negative"],
+        ),
+        row=1, col=1
+    )
+
+    # 이동평균선
+    if show_sma:
+        if "SMA_20" in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["SMA_20"],
+                    mode="lines",
+                    name="SMA 20",
+                    line=dict(color="#f59e0b", width=1),
+                ),
+                row=1, col=1
+            )
+        if "SMA_50" in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["SMA_50"],
+                    mode="lines",
+                    name="SMA 50",
+                    line=dict(color="#3b82f6", width=1),
+                ),
+                row=1, col=1
+            )
+
+    # 볼린저 밴드
+    if show_bb and "BB_Upper" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["BB_Upper"],
+                mode="lines",
+                name="BB 상단",
+                line=dict(color="#94a3b8", width=1, dash="dash"),
+            ),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["BB_Lower"],
+                mode="lines",
+                name="BB 하단",
+                line=dict(color="#94a3b8", width=1, dash="dash"),
+                fill="tonexty",
+                fillcolor="rgba(148, 163, 184, 0.1)",
+            ),
+            row=1, col=1
+        )
+
+    # 거래량
+    if show_volume:
+        colors = [COLOR_PALETTE["positive"] if df["Close"].iloc[i] >= df["Open"].iloc[i]
+                  else COLOR_PALETTE["negative"] for i in range(len(df))]
+        fig.add_trace(
+            go.Bar(
+                x=df.index,
+                y=df["Volume"],
+                name="거래량",
+                marker_color=colors,
+                showlegend=False,
+            ),
+            row=2, col=1
+        )
+
+    # 레이아웃
+    fig.update_layout(
+        height=height,
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        template="plotly_white",
+        margin=dict(l=50, r=50, t=50, b=50),
+    )
+
+    fig.update_xaxes(title_text="시간", row=rows, col=1)
+    fig.update_yaxes(title_text="가격 (USD)", row=1, col=1)
+    if show_volume:
+        fig.update_yaxes(title_text="거래량", row=2, col=1)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_technical_indicators(df: pd.DataFrame) -> None:
+    """기술적 지표 차트 렌더링 (RSI, MACD)
+
+    Args:
+        df: 기술적 지표가 포함된 데이터프레임
+    """
+    if df.empty:
+        return
+
+    # RSI와 MACD 서브플롯
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+        subplot_titles=("RSI (Relative Strength Index)", "MACD"),
+        row_heights=[0.5, 0.5]
+    )
+
+    # RSI
+    if "RSI" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["RSI"],
+                mode="lines",
+                name="RSI",
+                line=dict(color=COLOR_PALETTE["primary"], width=2),
+            ),
+            row=1, col=1
+        )
+        # 과매수/과매도 라인
+        fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="과매수", row=1, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="과매도", row=1, col=1)
+
+    # MACD
+    if "MACD" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["MACD"],
+                mode="lines",
+                name="MACD",
+                line=dict(color=COLOR_PALETTE["primary"], width=2),
+            ),
+            row=2, col=1
+        )
+        if "MACD_Signal" in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["MACD_Signal"],
+                    mode="lines",
+                    name="Signal",
+                    line=dict(color=COLOR_PALETTE["warning"], width=2),
+                ),
+                row=2, col=1
+            )
+        if "MACD_Hist" in df.columns:
+            colors = [COLOR_PALETTE["positive"] if v >= 0 else COLOR_PALETTE["negative"]
+                      for v in df["MACD_Hist"]]
+            fig.add_trace(
+                go.Bar(
+                    x=df.index,
+                    y=df["MACD_Hist"],
+                    name="Histogram",
+                    marker_color=colors,
+                ),
+                row=2, col=1
+            )
+
+    # 레이아웃
+    fig.update_layout(
+        height=500,
+        hovermode="x unified",
+        template="plotly_white",
+        margin=dict(l=50, r=50, t=50, b=50),
+        showlegend=True,
+    )
+
+    fig.update_yaxes(title_text="RSI", row=1, col=1)
+    fig.update_yaxes(title_text="MACD", row=2, col=1)
+    fig.update_xaxes(title_text="시간", row=2, col=1)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def create_dashboard_layout() -> Tuple[Any, Any, Any]:
     """대시보드 레이아웃 생성
-    
+
     Returns:
-        tab_a, tab_b 컨테이너
+        tab_a, tab_b, tab_c 컨테이너
     """
     st.set_page_config(
         page_title="S&P 리스크·신호 집계판",
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    
+
     # 헤더
     st.title("S&P 500 리스크·신호 집계판 + 확률 콘 대시보드")
-    
+
     # 최종 업데이트 시간
     st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
+
     # 탭 생성
-    tab_a, tab_b = st.tabs(["매크로 시황 요약", "S&P 500 팬 차트"])
-    
-    return tab_a, tab_b
+    tab_a, tab_b, tab_c = st.tabs(["매크로 시황 요약", "S&P 500 팬 차트", "실시간 차트"])
+
+    return tab_a, tab_b, tab_c

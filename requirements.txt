@@ -102,3 +102,4 @@ watchdog==6.0.0
 wcwidth==0.2.13
 python-dotenv==1.0.1
 google-generativeai==0.7.2
+yfinance==0.2.49

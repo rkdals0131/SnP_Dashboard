@@ -17,7 +17,12 @@ import streamlit as st
 from structlog import get_logger
 
 from src.models_quantile import load_models, predict_fanchart
-from src.scenarios import apply_shocks, compute_contributions, DEFAULT_SCENARIOS
+from src.scenarios import (
+    apply_shocks,
+    compute_contributions,
+    create_scenario_comparison,
+    DEFAULT_SCENARIOS,
+)
 from src.data_sources import FREDSource, FXSource
 from src.align_vintage import (
     create_month_end_calendar,
@@ -39,6 +44,16 @@ from src.viz import (
     render_contribution_chart,
     render_scenario_comparison,
     render_auto_summary,
+    render_candlestick_chart,
+    render_technical_indicators,
+)
+from src.intraday_data import fetch_intraday_data, calculate_technicals, get_current_price
+from src.automation import (
+    run_full_pipeline,
+    run_ingest_pipeline,
+    run_features_pipeline,
+    run_training_pipeline,
+    PipelineProgress,
 )
 
 
@@ -175,10 +190,71 @@ def _select_feature_row(features: pd.DataFrame) -> pd.Series:
 
 
 def main() -> None:
-    tab_a, tab_b = create_dashboard_layout()
+    tab_a, tab_b, tab_c = create_dashboard_layout()
 
-    # 사이드바: 설정/시나리오 및 탭 A 새로고침
+    # 사이드바: 자동화 및 설정
     with st.sidebar:
+        st.header("⚙️ 자동화")
+
+        # 초기 설정 버튼
+        if st.button("🚀 초기 설정 (전체 파이프라인)", use_container_width=True, type="primary"):
+            progress = PipelineProgress()
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            logs_container = st.expander("작업 로그", expanded=True)
+
+            with logs_container:
+                log_area = st.empty()
+
+            try:
+                with st.spinner("전체 파이프라인 실행 중..."):
+                    result = run_full_pipeline(progress, start_date="2010-01-01")
+
+                    # 실시간 진행 상황 업데이트
+                    while progress.status == "running":
+                        progress_bar.progress(progress.current_progress)
+                        status_text.text(progress.current_step)
+                        log_area.text("\n".join(progress.logs[-20:]))  # 최근 20개 로그
+
+                if result:
+                    st.success("✅ 초기 설정이 완료되었습니다!")
+                    st.cache_data.clear()
+                else:
+                    st.error(f"❌ 초기 설정 실패: {progress.error_message}")
+
+                log_area.text("\n".join(progress.logs[-20:]))
+
+            except Exception as e:
+                st.error(f"❌ 오류 발생: {str(e)}")
+
+        # 데이터 업데이트 버튼
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📥 데이터\n업데이트", use_container_width=True):
+                progress = PipelineProgress()
+                with st.spinner("데이터 업데이트 중..."):
+                    result = run_ingest_pipeline(progress)
+                    if result:
+                        result2 = run_features_pipeline(progress)
+                        if result2:
+                            st.success("✅ 데이터 업데이트 완료!")
+                            st.cache_data.clear()
+                        else:
+                            st.error("❌ 피처 생성 실패")
+                    else:
+                        st.error("❌ 데이터 수집 실패")
+
+        with col2:
+            if st.button("🎯 모델\n재학습", use_container_width=True):
+                progress = PipelineProgress()
+                with st.spinner("모델 재학습 중..."):
+                    result = run_training_pipeline(progress)
+                    if result:
+                        st.success("✅ 모델 재학습 완료!")
+                    else:
+                        st.error("❌ 모델 학습 실패")
+
+        st.markdown("---")
         st.header("설정 및 시나리오")
         refresh = st.button("탭 A 데이터 새로고침")
         if refresh:
@@ -360,6 +436,157 @@ def main() -> None:
             contrib = compute_contributions(models[horizon], delta, quantile=0.5)
             if not contrib.empty:
                 render_contribution_chart(contrib, top_n=5)
+
+        # 시나리오 비교 히트맵
+        st.markdown("---")
+        st.subheader("시나리오 비교")
+        st.caption("사전 정의된 시나리오들의 예상 수익률 변화를 비교합니다.")
+
+        with st.expander("시나리오 비교 히트맵 보기", expanded=False):
+            try:
+                # 시나리오 비교 실행
+                comparison_df = create_scenario_comparison(
+                    models,
+                    x_t,
+                    DEFAULT_SCENARIOS,
+                    horizons=list(models.keys())
+                )
+
+                if not comparison_df.empty:
+                    render_scenario_comparison(comparison_df, metric="중앙 수익률 변화")
+
+                    # 시나리오 설명 표시
+                    st.markdown("#### 시나리오 설명")
+                    for scenario_id, scenario_def in DEFAULT_SCENARIOS.items():
+                        with st.expander(scenario_def["name"]):
+                            st.write(scenario_def["description"])
+                            st.write("**적용된 쇼크:**")
+                            for shock_name, shock_value in scenario_def["shocks"].items():
+                                st.write(f"- {shock_name}: {shock_value:+.2f}")
+                else:
+                    st.warning("시나리오 비교 데이터가 없습니다.")
+
+            except Exception as e:
+                st.error(f"시나리오 비교 실패: {str(e)}")
+                logger.error("시나리오 비교 오류", error=str(e))
+
+    # 탭 C — 실시간 차트
+    with tab_c:
+        st.subheader("S&P 500 실시간 차트")
+
+        # 사이드바 설정
+        with st.sidebar:
+            st.markdown("---")
+            st.subheader("실시간 차트 설정")
+
+            # 데이터 간격 선택
+            interval_options = {
+                "1분": "1m",
+                "5분": "5m",
+                "15분": "15m",
+                "30분": "30m",
+                "1시간": "1h",
+                "1일": "1d",
+            }
+            interval_label = st.selectbox(
+                "데이터 간격",
+                options=list(interval_options.keys()),
+                index=4,  # 기본값: 1시간
+                help="1분 데이터는 최근 7일간만 사용 가능합니다."
+            )
+            interval = interval_options[interval_label]
+
+            # 기간 선택
+            if interval == "1m":
+                period_options = ["1일", "5일", "7일"]
+                default_period = "1일"
+            elif interval in ["5m", "15m", "30m"]:
+                period_options = ["1일", "5일", "1개월", "3개월"]
+                default_period = "5일"
+            elif interval == "1h":
+                period_options = ["1일", "5일", "1개월", "3개월", "6개월"]
+                default_period = "1개월"
+            else:  # 1d
+                period_options = ["1개월", "3개월", "6개월", "1년", "2년", "5년"]
+                default_period = "6개월"
+
+            period_label = st.selectbox("기간", options=period_options, index=period_options.index(default_period))
+
+            # 기간을 yfinance 형식으로 변환
+            period_map = {
+                "1일": "1d",
+                "5일": "5d",
+                "7일": "7d",
+                "1개월": "1mo",
+                "3개월": "3mo",
+                "6개월": "6mo",
+                "1년": "1y",
+                "2년": "2y",
+                "5년": "5y",
+            }
+            period = period_map[period_label]
+
+            # 차트 옵션
+            show_volume = st.checkbox("거래량 표시", value=True)
+            show_sma = st.checkbox("이동평균선 (SMA 20, 50)", value=True)
+            show_bb = st.checkbox("볼린저 밴드", value=False)
+            show_technicals = st.checkbox("기술적 지표 (RSI, MACD)", value=True)
+
+            # 새로고침 버튼
+            refresh_chart = st.button("차트 새로고침", key="refresh_chart")
+
+        # 데이터 가져오기
+        with st.spinner("데이터를 가져오는 중..."):
+            df = fetch_intraday_data(symbol="^GSPC", interval=interval, period=period)
+
+        if df.empty:
+            st.error("데이터를 가져올 수 없습니다. 네트워크 연결을 확인하거나 나중에 다시 시도하세요.")
+        else:
+            # 현재 가격 표시
+            current_price = df["Close"].iloc[-1]
+            prev_close = df["Close"].iloc[-2] if len(df) > 1 else current_price
+            price_change = current_price - prev_close
+            price_change_pct = (price_change / prev_close) * 100 if prev_close != 0 else 0
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("현재 가격", f"${current_price:,.2f}", f"{price_change:+.2f} ({price_change_pct:+.2f}%)")
+            with col2:
+                st.metric("고가", f"${df['High'].iloc[-1]:,.2f}")
+            with col3:
+                st.metric("저가", f"${df['Low'].iloc[-1]:,.2f}")
+            with col4:
+                st.metric("거래량", f"{df['Volume'].iloc[-1]:,.0f}")
+
+            # 기술적 지표 계산
+            if show_sma or show_bb or show_technicals:
+                df = calculate_technicals(df)
+
+            # 캔들스틱 차트
+            render_candlestick_chart(
+                df,
+                title=f"S&P 500 ({interval_label} 차트)",
+                show_volume=show_volume,
+                show_sma=show_sma,
+                show_bb=show_bb,
+            )
+
+            # 기술적 지표 차트
+            if show_technicals:
+                render_technical_indicators(df)
+
+            # 데이터 요약
+            with st.expander("데이터 요약"):
+                st.write(f"총 데이터 포인트: {len(df)}")
+                st.write(f"시작: {df.index.min()}")
+                st.write(f"종료: {df.index.max()}")
+
+                # 최근 데이터 표시
+                st.subheader("최근 데이터 (최근 10개)")
+                st.dataframe(
+                    df.tail(10).sort_index(ascending=False),
+                    use_container_width=True,
+                )
 
 
 if __name__ == "__main__":
