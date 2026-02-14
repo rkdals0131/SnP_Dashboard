@@ -70,6 +70,7 @@ TOOLTIP_DEFINITIONS = {
     "DCOILWTICO": "WTI 원유 가격.",
     "GOLDAMGBD228NLBM": "금 가격(LBMA 오전 고시, 달러/온스).",
     "NFCI": "시카고 연은 금융여건지수. 0보다 크면 긴축, 작으면 완화.",
+    "CRYPTO_FNG": "Alternative.me Crypto Fear & Greed Index(0~100). 높을수록 탐욕 심리 우세.",
     # Labor / Inflation / Policy
     "UNRATE": "실업률(%) — 노동시장 상황.",
     "PAYEMS": "비농업 신규고용(천 명).",
@@ -506,24 +507,48 @@ def render_fan_chart(
     # 팬차트 예측
     horizon = fanchart_data["horizon"]
     quantiles = fanchart_data["quantiles"]
-    
-    # 예측 날짜 생성 (간단한 예시)
+
+    # 예측 날짜 생성
     last_date = price_history.index[-1] if not price_history.empty else pd.Timestamp.now()
-    
-    if horizon == "1M":
-        future_dates = pd.date_range(start=last_date, periods=22, freq='B')
-    elif horizon == "3M":
-        future_dates = pd.date_range(start=last_date, periods=65, freq='B')
-    elif horizon == "6M":
-        future_dates = pd.date_range(start=last_date, periods=130, freq='B')
-    else:  # 12M
-        future_dates = pd.date_range(start=last_date, periods=252, freq='B')
-    
-    # 분위별 가격 계산
-    price_paths = {}
-    for q_key, return_val in quantiles.items():
-        price_path = current_price * np.exp(return_val[0])
-        price_paths[q_key] = [current_price, price_path]
+    periods_map = {"1M": 22, "3M": 65, "6M": 130, "12M": 252}
+    n_steps = periods_map.get(horizon, 22)
+    future_dates = pd.bdate_range(start=last_date + pd.offsets.BDay(1), periods=n_steps)
+    x_fan = [last_date] + list(future_dates)
+
+    def _endpoint_return(val: Union[np.ndarray, List[float], float, int]) -> float:
+        if isinstance(val, np.ndarray):
+            return float(val[0]) if len(val) > 0 else float("nan")
+        if isinstance(val, list):
+            return float(val[0]) if len(val) > 0 else float("nan")
+        return float(val)
+
+    endpoint_returns: Dict[str, float] = {}
+    for q_key, q_val in quantiles.items():
+        try:
+            endpoint_returns[q_key] = _endpoint_return(q_val)
+        except Exception:
+            continue
+
+    if not endpoint_returns:
+        st.warning("팬차트 예측 분위 데이터가 비어 있습니다.")
+        return
+
+    # 시간 경과에 따라 중앙값은 선형, 폭은 sqrt(t)로 확장
+    t = np.linspace(0.0, 1.0, n_steps + 1)
+    median_end = endpoint_returns.get("q50")
+    if median_end is None or np.isnan(median_end):
+        median_end = float(np.nanmedian(list(endpoint_returns.values())))
+
+    median_path = median_end * t
+    price_paths: Dict[str, List[float]] = {}
+    for q_key, q_end in endpoint_returns.items():
+        spread_end = q_end - median_end
+        ret_path = median_path + spread_end * np.sqrt(t)
+        ret_path[0] = 0.0
+        price_paths[q_key] = (current_price * np.exp(ret_path)).tolist()
+
+    if "q50" not in price_paths:
+        price_paths["q50"] = (current_price * np.exp(median_path)).tolist()
     
     # 팬차트 영역 그리기 (밴드)
     bands = [
@@ -531,8 +556,6 @@ def render_fan_chart(
         ("q10", "q90", "rgba(59, 130, 246, 0.2)", "80% 구간"),
         ("q25", "q75", "rgba(59, 130, 246, 0.3)", "50% 구간")
     ]
-    
-    x_fan = [last_date, future_dates[-1]]
     
     for lower, upper, color, name in bands:
         if lower in price_paths and upper in price_paths:
@@ -612,6 +635,114 @@ def render_uncertainty_gauge(
     ))
     
     fig.update_layout(height=250, margin=dict(l=20, r=20, t=40, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_bollinger_bands(
+    price_series: pd.Series,
+    window: int = 20,
+    num_std: float = 2.0,
+    lookback: int = 252,
+) -> None:
+    """일봉 볼린저 밴드 렌더링
+
+    Args:
+        price_series: 일봉 가격 시계열
+        window: 이동평균 윈도우
+        num_std: 표준편차 배수
+        lookback: 표시할 최근 관측치 수
+    """
+    s = price_series.sort_index().dropna()
+    if s.empty or len(s) < window:
+        st.info("볼린저 밴드를 계산할 일봉 데이터가 부족합니다.")
+        return
+
+    if lookback > 0 and len(s) > lookback:
+        s = s.iloc[-lookback:]
+
+    middle = s.rolling(window=window, min_periods=window).mean()
+    std = s.rolling(window=window, min_periods=window).std()
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+
+    bb = pd.DataFrame(
+        {
+            "close": s,
+            "middle": middle,
+            "upper": upper,
+            "lower": lower,
+        }
+    ).dropna()
+
+    if bb.empty:
+        st.info("볼린저 밴드 계산 결과가 비어 있습니다.")
+        return
+
+    latest = bb.iloc[-1]
+    latest_close = float(latest["close"])
+    latest_upper = float(latest["upper"])
+    latest_lower = float(latest["lower"])
+    latest_middle = float(latest["middle"])
+
+    if latest_close > latest_upper:
+        position_text = "상단 돌파"
+    elif latest_close < latest_lower:
+        position_text = "하단 이탈"
+    else:
+        position_text = "밴드 내부"
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("현재가", f"{latest_close:,.2f}")
+    c2.metric("20D SMA", f"{latest_middle:,.2f}")
+    c3.metric("밴드 위치", position_text)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=bb.index,
+            y=bb["upper"],
+            mode="lines",
+            name=f"상단(+{num_std:.1f}σ)",
+            line=dict(color=COLOR_PALETTE["warning"], width=1.5),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=bb.index,
+            y=bb["lower"],
+            mode="lines",
+            name=f"하단(-{num_std:.1f}σ)",
+            fill="tonexty",
+            fillcolor="rgba(59,130,246,0.12)",
+            line=dict(color=COLOR_PALETTE["warning"], width=1.5),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=bb.index,
+            y=bb["middle"],
+            mode="lines",
+            name=f"{window}D SMA",
+            line=dict(color=COLOR_PALETTE["neutral"], width=1.5, dash="dash"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=bb.index,
+            y=bb["close"],
+            mode="lines",
+            name="SP500 Close",
+            line=dict(color=COLOR_PALETTE["primary"], width=2),
+        )
+    )
+
+    fig.update_layout(
+        title=f"S&P 500 Bollinger Bands ({window}D, {num_std:.1f}σ)",
+        xaxis_title="날짜",
+        yaxis_title="지수",
+        hovermode="x unified",
+        height=420,
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 

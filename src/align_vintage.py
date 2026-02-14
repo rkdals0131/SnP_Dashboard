@@ -31,6 +31,7 @@ PUBLICATION_RULES = {
     "SP500": "1BD",  # S&P 500 지수
     "DCOILWTICO": "1BD",  # WTI 유가
     "GOLDAMGBD228NLBM": "1BD",  # 금 가격 (LBMA AM, USD)
+    "CRYPTO_FNG": "1BD",  # Alternative.me Crypto Fear & Greed Index
     # 환율(일별)
     "USDKRW": "1BD",
     "USDJPY": "1BD",

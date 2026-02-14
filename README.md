@@ -5,7 +5,7 @@ S&P 500 리스크·신호 집계판 (SNP Dashboard)
 
 ## 무엇을 제공하나요?
 
-- 데이터 파이프라인: FRED 등 공공 데이터 수집(캐시), 월말 빈티지 정렬, 발표 지연 규칙 적용
+- 데이터 파이프라인: FRED/환율/공포-탐욕 지수(옵션) 수집(캐시), 월말 빈티지 정렬, 발표 지연 규칙 적용
 - 피처 엔지니어링: 1차·2차 차분, 백분위 스코어, TERM_SPREAD, Breadth, MacroScore, 레짐 배지 등
 - 타깃 생성: S&P 500의 1M/3M/6M/12M 로그 수익률(선행) 타깃
 - 모델링: 분위 회귀 모델(여러 분위) + 단기 VIX 앵커링 블렌드(안정성)
@@ -24,6 +24,8 @@ S&P 500 리스크·신호 집계판 (SNP Dashboard)
   - 개발(에디터블): `pip install -e .[dev]`
 - 환경변수
   - 루트에 `.env` 생성: `FRED_API_KEY=...`
+  - 선택(탭 A AI 요약): `GEMINI_API_KEY=...` 또는 `GOOGLE_API_KEY=...`
+  - 선택(모델 고정): `GEMINI_MODEL=gemini-2.5-flash-lite`
   - 키가 없으면 수집이 실패합니다(캐시가 있으면 재시도 시 빠름).
 
 
@@ -32,6 +34,10 @@ S&P 500 리스크·신호 집계판 (SNP Dashboard)
 1) 데이터 수집(핵심 시리즈만 예시)
 - `python -m src.cli ingest --source fred --series DGS10,DGS3MO,VIXCLS,SP500 --start 2010-01-01`
 - 산출물: `data/raw/fred/{DGS10,DGS3MO,VIXCLS,SP500}.parquet`
+
+1-1) 공포-탐욕 지수(옵션)
+- `python -m src.cli ingest --source fear_greed --series CRYPTO_FNG --start 2018-01-01`
+- 산출물: `data/raw/fear_greed/CRYPTO_FNG.parquet`
 
 2) 피처 생성(정합+빈티지 지연+피처/타깃)
 - `python -m src.cli features --calendar-start 2010-01-01`
@@ -55,10 +61,10 @@ S&P 500 리스크·신호 집계판 (SNP Dashboard)
 아래 모든 명령은 `python -m src.cli <command> [options]` 형태로 실행합니다.
 
 ### ingest — 공공 데이터 수집 및 캐시
-- 설명: FRED API에서 월별/일별 시계열을 수집해 Parquet로 저장합니다.
+- 설명: FRED 또는 Fear & Greed API에서 시계열을 수집해 Parquet로 저장합니다.
 - 기본 시리즈: `DGS10, DGS3MO, DGS2, VIXCLS, SP500, DCOILWTICO, BAA, BAMLH0A0HYM2, UNRATE, CPIAUCSL, CPILFESL, NFCI`
 - 옵션
-  - `--source`: 데이터 소스(기본: `fred`)
+  - `--source`: 데이터 소스(기본: `fred`, 지원: `fear_greed`)
   - `--series`: 수집할 시리즈(쉼표). 생략 시 기본 셋 사용
   - `--start`: 시작일(YYYY-MM-DD, 기본: `2000-01-01`)
   - `--end`: 종료일(미지정 시 오늘)
@@ -115,8 +121,9 @@ S&P 500 리스크·신호 집계판 (SNP Dashboard)
 - 탭 A — 매크로 시황 요약
   - MacroScore/모멘텀/가속도 타일, Breadth 바, 레짐 배지, 핵심 지표 카드, 자동 요약
 - 탭 B — S&P 500 팬 차트
-  - 과거 가격 + 분위 밴드(50/80/90%), 중앙 경로
+  - 과거 가격 + 분위 밴드(50/80/90%), 중앙 경로(시간축 확산형)
   - 불확실성 게이지: IQR 폭 vs. 역사적 평균
+  - 일봉 볼린저 밴드(20D, 2σ)
   - 시나리오 쇼크(슬라이더/프리셋), 기여도(계수×Δ특성, 단순화)
 
 
@@ -153,4 +160,3 @@ S&P 500 리스크·신호 집계판 (SNP Dashboard)
   - `src/features.py`: 피처 엔지니어링
   - `src/align_vintage.py`: 월말 캘린더/발표 지연 규칙
   - `app/streamlit_app.py`, `src/viz.py`: 대시보드 UI/시각화
-

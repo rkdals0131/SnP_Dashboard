@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional, Protocol, Any, List, Tuple
 
 import pandas as pd
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
@@ -228,6 +229,180 @@ class FREDSource:
             
         except Exception as e:
             logger.error("캐시 저장 실패", series_id=series_id, error=str(e))
+
+
+class FearGreedSource:
+    """공포-탐욕 지수 API 어댑터
+
+    기본 제공자는 Alternative.me(/fng/)이며, 일별 지수(0~100)를 수집합니다.
+    """
+
+    name = "fear_greed"
+    ALTERNATIVE_URL = "https://api.alternative.me/fng/"
+
+    def __init__(
+        self,
+        provider: str = "alternative",
+        cache_dir: Optional[Path] = None,
+        max_retries: int = 3,
+        backoff_factor: float = 1.0,
+    ) -> None:
+        self.provider = provider.lower()
+        self.cache_dir = cache_dir or Path("data/raw/fear_greed")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        logger.info("FearGreed 소스 초기화", provider=self.provider, cache_dir=str(self.cache_dir))
+
+    def fetch(
+        self,
+        series: Iterable[str],
+        start: date,
+        end: date,
+        use_cache: bool = True,
+        **kw: Any,
+    ) -> pd.DataFrame:
+        """공포-탐욕 지수 시계열 수집
+
+        Args:
+            series: 시리즈 ID 목록(예: ["CRYPTO_FNG"])
+            start: 시작일
+            end: 종료일
+            use_cache: 캐시 사용 여부
+
+        Returns:
+            통합된 DataFrame (index=date, columns=[series_id,value,value_classification,realtime_start,realtime_end,source])
+        """
+        all_data: List[pd.DataFrame] = []
+
+        for series_id in series:
+            if use_cache:
+                cached_df = self._load_cache(series_id, start, end)
+                if cached_df is not None:
+                    all_data.append(cached_df)
+                    continue
+
+            if self.provider != "alternative":
+                raise ValueError(f"지원하지 않는 provider: {self.provider}")
+
+            raw_df = self._fetch_alternative(series_id)
+            if raw_df is None or raw_df.empty:
+                continue
+
+            # 전체 이력을 캐시에 저장하고 요청 구간만 반환
+            self._save_cache(series_id, raw_df)
+            mask = (raw_df.index >= pd.Timestamp(start)) & (raw_df.index <= pd.Timestamp(end))
+            all_data.append(raw_df.loc[mask])
+
+        if not all_data:
+            return pd.DataFrame()
+
+        result = pd.concat(all_data, ignore_index=False).sort_index()
+        logger.info("FearGreed 데이터 수집 완료", total_rows=len(result))
+        return result
+
+    def _fetch_alternative(self, series_id: str) -> Optional[pd.DataFrame]:
+        params = {
+            "limit": 0,      # 전체 이력
+            "format": "json"
+        }
+
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.get(self.ALTERNATIVE_URL, params=params, timeout=20)
+                response.raise_for_status()
+                payload = response.json()
+                df = self._parse_alternative_payload(payload, series_id)
+                logger.info("Alternative.me 수집 성공", series_id=series_id, rows=len(df))
+                return df
+            except requests.exceptions.RequestException as e:
+                wait_time = self.backoff_factor * (2 ** attempt)
+                logger.warning(
+                    "Alternative.me 호출 실패, 재시도 대기",
+                    attempt=attempt + 1,
+                    wait_time=wait_time,
+                    error=str(e),
+                )
+                if attempt < self.max_retries - 1:
+                    time.sleep(wait_time)
+                else:
+                    logger.error("Alternative.me 최대 재시도 초과", series_id=series_id)
+                    return None
+            except Exception as e:
+                logger.error("Alternative.me 파싱 실패", series_id=series_id, error=str(e))
+                return None
+
+    @staticmethod
+    def _parse_alternative_payload(payload: Dict[str, Any], series_id: str) -> pd.DataFrame:
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        if metadata.get("error"):
+            raise ValueError(f"Alternative.me API error: {metadata.get('error')}")
+
+        rows: List[Dict[str, Any]] = []
+        for rec in payload.get("data", []):
+            ts_raw = rec.get("timestamp")
+            if ts_raw is None:
+                continue
+            ts = pd.to_datetime(int(ts_raw), unit="s")
+            day = pd.Timestamp(ts.date())
+
+            rows.append(
+                {
+                    "date": day,
+                    "series_id": series_id,
+                    "value": float(rec.get("value")) if rec.get("value") is not None else np.nan,
+                    "value_classification": rec.get("value_classification"),
+                    "realtime_start": day.strftime("%Y-%m-%d"),
+                    "realtime_end": day.strftime("%Y-%m-%d"),
+                    "source": "alternative.me",
+                }
+            )
+
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "series_id",
+                    "value",
+                    "value_classification",
+                    "realtime_start",
+                    "realtime_end",
+                    "source",
+                ]
+            )
+
+        df = pd.DataFrame.from_records(rows).set_index("date").sort_index()
+        # 동일 날짜 중복 시 최신 레코드 유지
+        df = df[~df.index.duplicated(keep="last")]
+        return df
+
+    def _load_cache(self, series_id: str, start: date, end: date) -> Optional[pd.DataFrame]:
+        cache_file = self.cache_dir / f"{series_id}.parquet"
+        if not cache_file.exists():
+            return None
+
+        try:
+            df = pd.read_parquet(cache_file)
+            mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
+            df_filtered = df[mask]
+            if len(df_filtered) > 0:
+                logger.info("FearGreed 캐시에서 로드", series_id=series_id, rows=len(df_filtered))
+                return df_filtered
+        except Exception as e:
+            logger.warning("FearGreed 캐시 로드 실패", series_id=series_id, error=str(e))
+
+        return None
+
+    def _save_cache(self, series_id: str, df: pd.DataFrame) -> None:
+        cache_file = self.cache_dir / f"{series_id}.parquet"
+        try:
+            if cache_file.exists():
+                existing_df = pd.read_parquet(cache_file)
+                df = pd.concat([existing_df, df]).drop_duplicates()
+                df = df.sort_index()
+            df.to_parquet(cache_file, compression="snappy")
+            logger.info("FearGreed 캐시 저장 완료", series_id=series_id, file=str(cache_file))
+        except Exception as e:
+            logger.error("FearGreed 캐시 저장 실패", series_id=series_id, error=str(e))
 
 
 def persist_parquet(df: pd.DataFrame, path: Path) -> None:

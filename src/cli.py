@@ -33,7 +33,7 @@ except Exception:
     pass
 
 # 로컬 모듈 임포트
-from .data_sources import FREDSource, persist_parquet
+from .data_sources import FREDSource, FearGreedSource, persist_parquet
 from .align_vintage import (
     create_month_end_calendar,
     build_master_panel,
@@ -75,7 +75,7 @@ DEFAULT_SERIES = [
 
 @cli.command()
 def ingest(
-    source: str = typer.Option("fred", help="데이터 소스 (fred, bls, bea)"),
+    source: str = typer.Option("fred", help="데이터 소스 (fred, fear_greed, bls, bea)"),
     series: Optional[str] = typer.Option(None, help="수집할 시리즈 (쉼표 구분)"),
     start: str = typer.Option("2000-01-01", help="시작 날짜 (YYYY-MM-DD)"),
     end: Optional[str] = typer.Option(None, help="종료 날짜 (YYYY-MM-DD)"),
@@ -88,9 +88,14 @@ def ingest(
     console.print(f"[bold blue]데이터 수집 시작[/bold blue]")
     console.print(f"소스: {source}")
     
-    # 시리즈 파싱
+    source_lc = source.lower()
+
+    # 시리즈 파싱(소스별 기본값)
     if series:
         series_list = [s.strip() for s in series.split(",")]
+    elif source_lc in {"fear_greed", "fng", "feargreed"}:
+        series_list = ["CRYPTO_FNG"]
+        console.print("기본 시리즈 사용: CRYPTO_FNG")
     else:
         series_list = DEFAULT_SERIES
         console.print(f"기본 시리즈 사용: {len(series_list)}개")
@@ -103,7 +108,7 @@ def ingest(
     console.print(f"시리즈: {', '.join(series_list)}")
     
     # 소스별 처리
-    if source.lower() == "fred":
+    if source_lc == "fred":
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -145,7 +150,51 @@ def ingest(
             except Exception as e:
                 console.print(f"[red]오류 발생: {e}[/red]")
                 raise typer.Exit(1)
-    
+
+    elif source_lc in {"fear_greed", "fng", "feargreed"}:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("공포-탐욕 지수 수집 중...", total=len(series_list))
+
+            try:
+                fng = FearGreedSource(cache_dir=RAW_DIR / "fear_greed")
+                df = fng.fetch(series_list, start_date, end_date)
+
+                if df.empty:
+                    console.print("[red]수집된 공포-탐욕 데이터가 없습니다.[/red]")
+                    raise typer.Exit(1)
+
+                table = Table(title="공포-탐욕 수집 결과")
+                table.add_column("시리즈", style="cyan")
+                table.add_column("관측치", style="magenta")
+                table.add_column("시작일", style="green")
+                table.add_column("종료일", style="green")
+                table.add_column("최신값", style="yellow")
+
+                for series_id in series_list:
+                    series_data = df[df["series_id"] == series_id]
+                    if series_data.empty:
+                        continue
+                    latest_value = series_data["value"].dropna().iloc[-1] if not series_data["value"].dropna().empty else float("nan")
+                    table.add_row(
+                        series_id,
+                        str(len(series_data)),
+                        str(series_data.index.min().date()),
+                        str(series_data.index.max().date()),
+                        f"{latest_value:.1f}" if pd.notna(latest_value) else "N/A",
+                    )
+
+                progress.update(task, completed=len(series_list))
+                console.print(table)
+                console.print("[green]✓ 공포-탐욕 데이터 수집 완료![/green]")
+
+            except Exception as e:
+                console.print(f"[red]오류 발생: {e}[/red]")
+                raise typer.Exit(1)
+
     else:
         console.print(f"[yellow]'{source}' 소스는 아직 구현되지 않았습니다.[/yellow]")
         raise typer.Exit(1)
