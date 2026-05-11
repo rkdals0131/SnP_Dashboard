@@ -542,6 +542,7 @@ def validate(
 @cli.command(name="app")
 def run_app(
     port: int = typer.Option(8501, help="포트 번호"),
+    host: str = typer.Option("0.0.0.0", help="바인드 주소 (WSL/LAN 접근은 0.0.0.0 권장)"),
     debug: bool = typer.Option(False, help="디버그 모드")
 ):
     """대시보드 실행 명령
@@ -564,13 +565,16 @@ def run_app(
         "streamlit", "run",
         str(app_path),
         f"--server.port={port}",
+        f"--server.address={host}",
         "--server.headless=true"
     ]
     
     if debug:
         cmd.append("--logger.level=debug")
     
-    console.print(f"대시보드 시작 중... (http://localhost:{port})")
+    console.print(f"대시보드 시작 중... (http://{host}:{port})")
+    if host == "0.0.0.0":
+        console.print(f"같은 네트워크에서는 WSL/호스트 IP와 포트 {port}로 접속하세요.")
     console.print("종료하려면 Ctrl+C를 누르세요.")
     
     try:

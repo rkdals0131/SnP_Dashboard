@@ -1,24 +1,21 @@
-"""Streamlit dashboard for macro overview and S&P 500 fan chart."""
+"""Streamlit dashboard for GLD/SIVR/UPRO rebalancing."""
 
 from __future__ import annotations
 
-import json
 import sys
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import structlog
 
 
 def _configure_structlog_for_streamlit() -> None:
-    """Avoid PrintLogger writes that can fail on some Windows/Streamlit sessions."""
     if getattr(_configure_structlog_for_streamlit, "_done", False):
         return
-
     structlog.configure(
         processors=[],
         wrapper_class=structlog.BoundLogger,
@@ -29,823 +26,468 @@ def _configure_structlog_for_streamlit() -> None:
 
 
 _configure_structlog_for_streamlit()
-from structlog import get_logger
-
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.align_vintage import (  # noqa: E402
-    PUBLICATION_RULES,
-    apply_publication_delays,
-    build_master_panel,
-    create_month_end_calendar,
+from src.backtesting import (  # noqa: E402
+    BacktestConfig,
+    close_panel,
+    run_backtest_suite,
+    signal_quality_report,
 )
-from src.data_sources import FREDSource, FXSource, FearGreedSource  # noqa: E402
-from src.features import build_feature_panel  # noqa: E402
-from src.models_quantile import (  # noqa: E402
-    DEFAULT_QUANTILES,
-    load_models,
-    predict_fanchart,
-    save_models,
-    train_models,
+from src.market_data import (  # noqa: E402
+    DEFAULT_PRICE_TICKERS,
+    TICKER_LABELS,
+    fetch_cnn_fear_greed,
+    fetch_crypto_fear_greed,
+    fetch_yfinance_prices,
 )
-from src.scenarios import (  # noqa: E402
-    DEFAULT_SCENARIOS,
-    apply_shocks,
-    compute_contributions,
-    create_scenario_comparison,
-)
-from src.targets import (  # noqa: E402
-    align_targets_with_features,
-    compute_forward_returns,
-    save_targets,
-)
-from src.validation import (  # noqa: E402
-    ValidationConfig,
-    create_validation_report,
-    run_rolling_validation,
-)
-from src.viz import (  # noqa: E402
-    create_dashboard_layout,
-    render_ai_one_liner,
-    render_auto_summary,
-    render_bollinger_bands,
-    render_breadth_bar,
-    render_contribution_chart,
-    render_fan_chart,
-    render_indicator_card,
-    render_indicator_narratives,
-    render_macro_score_tile,
-    render_regime_badges,
-    render_scenario_comparison,
-    render_uncertainty_gauge,
+from src.portfolio import (  # noqa: E402
+    BollingerConfig,
+    classify_core_signal,
+    classify_upro_tactical_signal,
+    compute_bollinger_features,
+    compute_rebalance_orders,
+    latest_signal_row,
 )
 
-
-logger = get_logger()
-
-DATA_DIR = Path("data")
-RAW_DIR = DATA_DIR / "raw"
-PROCESSED_PATH = DATA_DIR / "processed" / "master_timeseries.parquet"
-FEATURES_PATH = DATA_DIR / "features" / "features.parquet"
-TARGETS_PATH = DATA_DIR / "targets" / "targets.parquet"
-MODELS_DIR = Path("models")
-EVALUATIONS_DIR = Path("evaluations")
-
-SHOCK_ALIASES = {
-    "VIX": "VIXCLS",
-    "CREDIT_SPREAD": "BAMLH0A0HYM2",
+PORTFOLIO_TICKERS = ["GLD", "SIVR", "UPRO"]
+REFERENCE_TICKERS = ["^GSPC", "^IXIC", "^VIX"]
+TONE_COLORS = {
+    "positive": "#16a34a",
+    "negative": "#dc2626",
+    "warning": "#d97706",
+    "neutral": "#475569",
 }
 
 
-try:
-    from dotenv import find_dotenv, load_dotenv
-
-    load_dotenv(find_dotenv())
-except Exception:
-    pass
-
-
-def _safe_log(level: str, event: str, **kwargs: Any) -> None:
-    try:
-        getattr(logger, level)(event, **kwargs)
-    except Exception:
-        pass
-
-
-def _parse_csv_list(text: str) -> List[str]:
-    return [item.strip() for item in text.split(",") if item.strip()]
-
-
-def _parse_quantiles(text: str) -> List[float]:
-    if not text.strip():
-        return DEFAULT_QUANTILES
-    values: List[float] = []
-    for raw in _parse_csv_list(text):
-        value = float(raw)
-        if value <= 0.0 or value >= 1.0:
-            raise ValueError(f"Invalid quantile '{raw}'. Must be between 0 and 1.")
-        values.append(value)
-    return sorted(set(values))
-
-
-def _default_series_for_tab_a() -> List[str]:
-    return [
-        "DGS10",
-        "DGS3MO",
-        "DGS2",
-        "VIXCLS",
-        "SP500",
-        "DCOILWTICO",
-        "GOLDAMGBD228NLBM",
-        "BAA",
-        "BAMLH0A0HYM2",
-        "UNRATE",
-        "CPIAUCSL",
-        "CPILFESL",
-        "NFCI",
-        "FEDFUNDS",
-        "PAYEMS",
-        "CIVPART",
-        "JTSJOL",
-        "DTWEXBGS",
-    ]
-
-
-def _collect_raw_paths(
-    series_list: Optional[List[str]] = None,
-    include_fx: bool = True,
-    include_fng: bool = True,
-) -> Dict[str, Path]:
-    raw_paths: Dict[str, Path] = {}
-
-    fred_dir = RAW_DIR / "fred"
-    if series_list is None:
-        for file in fred_dir.glob("*.parquet"):
-            raw_paths[file.stem] = file
-    else:
-        for sid in series_list:
-            file = fred_dir / f"{sid}.parquet"
-            if file.exists():
-                raw_paths[sid] = file
-
-    if include_fx:
-        fx_dir = RAW_DIR / "fx"
-        for file in fx_dir.glob("*.parquet"):
-            raw_paths[file.stem] = file
-
-    if include_fng:
-        fng_file = RAW_DIR / "fear_greed" / "CRYPTO_FNG.parquet"
-        if fng_file.exists():
-            raw_paths["CRYPTO_FNG"] = fng_file
-
-    return raw_paths
-
-
-def _load_features() -> Optional[pd.DataFrame]:
-    if FEATURES_PATH.exists():
-        return pd.read_parquet(FEATURES_PATH)
-    return None
-
-
-def _load_prices() -> Optional[pd.DataFrame]:
-    if PROCESSED_PATH.exists():
-        df = pd.read_parquet(PROCESSED_PATH)
-        if "SP500" in df.columns:
-            return df[["SP500"]].dropna()
-    return None
-
-
-def _load_daily_sp500() -> Optional[pd.Series]:
-    raw_path = RAW_DIR / "fred" / "SP500.parquet"
-    if not raw_path.exists():
-        return None
-
-    try:
-        df = pd.read_parquet(raw_path)
-        if "series_id" in df.columns:
-            df = df[df["series_id"] == "SP500"]
-
-        if "value" in df.columns:
-            values = pd.to_numeric(df["value"], errors="coerce")
-        elif "SP500" in df.columns:
-            values = pd.to_numeric(df["SP500"], errors="coerce")
-        else:
-            values = pd.to_numeric(df.iloc[:, 0], errors="coerce")
-
-        values.index = pd.to_datetime(values.index)
-        series = values.sort_index().dropna().rename("SP500")
-        return series if not series.empty else None
-    except Exception as exc:
-        _safe_log("warning", "daily_sp500_load_failed", error=str(exc))
-        return None
-
-
 @st.cache_data(ttl=300, show_spinner=False)
-def _build_live_features_for_tab_a(
-    start: str = "2000-01-01",
-    end: Optional[str] = None,
-) -> pd.DataFrame:
-    end_str = end or date.today().strftime("%Y-%m-%d")
-    start_dt = pd.to_datetime(start).date()
-    end_dt = pd.to_datetime(end_str).date()
-
-    series_list = _default_series_for_tab_a()
-    fx_pairs = ["USDKRW", "USDJPY", "USDEUR"]
-
-    fred = FREDSource()
-    _ = fred.fetch(series_list, start_dt, end_dt)
-
-    fx = FXSource()
-    _ = fx.fetch(fx_pairs, start_dt, end_dt)
-
-    try:
-        fng = FearGreedSource(provider="alternative")
-        _ = fng.fetch(["CRYPTO_FNG"], start_dt, end_dt)
-    except Exception as exc:
-        _safe_log("warning", "fear_greed_fetch_optional_failed", error=str(exc))
-
-    raw_paths = _collect_raw_paths(series_list=series_list, include_fx=True, include_fng=True)
-    if not raw_paths:
-        raise RuntimeError("No raw inputs found after live fetch.")
-
-    calendar = create_month_end_calendar(start, end_str)
-    master_panel = build_master_panel(raw_paths, calendar)
-    vintage_panel = apply_publication_delays(master_panel, PUBLICATION_RULES)
-    return build_feature_panel(vintage_panel)
+def _load_market_data(start: date, end: date, use_cache: bool) -> dict[str, pd.DataFrame]:
+    return fetch_yfinance_prices(DEFAULT_PRICE_TICKERS, start=start, end=end, use_cache=use_cache)
 
 
-def _select_feature_row(features: pd.DataFrame) -> pd.Series:
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_sentiment() -> dict[str, dict[str, object]]:
+    return {
+        "cnn": fetch_cnn_fear_greed(),
+        "crypto": fetch_crypto_fear_greed(),
+    }
+
+
+def _last_close(frame: pd.DataFrame) -> float:
+    if frame is None or frame.empty or "close" not in frame:
+        return float("nan")
+    return float(frame["close"].dropna().iloc[-1])
+
+
+def _price_delta(frame: pd.DataFrame, periods: int = 5) -> float:
+    if frame is None or len(frame.dropna(subset=["close"])) <= periods:
+        return float("nan")
+    close = frame["close"].dropna()
+    return float(close.iloc[-1] / close.iloc[-periods - 1] - 1.0)
+
+
+def _format_money(value: float) -> str:
+    if pd.isna(value):
+        return "-"
+    return f"${value:,.0f}"
+
+
+def _format_pct(value: float) -> str:
+    if pd.isna(value):
+        return "-"
+    return f"{value:.1%}"
+
+
+def _render_signal_badge(signal: dict[str, object]) -> None:
+    tone = str(signal.get("tone", "neutral"))
+    color = TONE_COLORS.get(tone, TONE_COLORS["neutral"])
+    st.markdown(
+        f"""
+        <div style="border-left:4px solid {color};padding:0.6rem 0.8rem;background:#f8fafc">
+          <strong>{signal.get("label", "-")}</strong><br>
+          <span style="color:#475569;font-size:0.9rem">{signal.get("detail", "")}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_bollinger_chart(
+    ticker: str,
+    features: pd.DataFrame,
+    lookback: int = 180,
+) -> None:
     if features.empty:
-        return pd.Series(dtype=float)
-    return features.ffill().bfill().iloc[-1]
+        st.info(f"{ticker} 차트 데이터가 없습니다.")
+        return
 
-
-def _list_model_snapshots() -> List[str]:
-    if not MODELS_DIR.exists():
-        return []
-    return sorted([p.name for p in MODELS_DIR.iterdir() if p.is_dir()])
-
-
-def _latest_snapshot() -> Optional[str]:
-    snaps = _list_model_snapshots()
-    return snaps[-1] if snaps else None
-
-
-def _normalize_shocks(shocks: Dict[str, float]) -> Dict[str, float]:
-    normalized: Dict[str, float] = {}
-    for key, value in shocks.items():
-        mapped = SHOCK_ALIASES.get(key, key)
-        normalized[mapped] = normalized.get(mapped, 0.0) + float(value)
-    return normalized
-
-
-def _ingest_data(start: date, end: date, include_fx: bool, include_fng: bool) -> Dict[str, int]:
-    series_list = _default_series_for_tab_a()
-    result = {"fred_rows": 0, "fx_rows": 0, "fear_greed_rows": 0}
-
-    fred = FREDSource()
-    fred_df = fred.fetch(series_list, start, end)
-    result["fred_rows"] = len(fred_df)
-
-    if include_fx:
-        fx = FXSource()
-        fx_df = fx.fetch(["USDKRW", "USDJPY", "USDEUR"], start, end)
-        result["fx_rows"] = len(fx_df)
-
-    if include_fng:
-        fng = FearGreedSource(provider="alternative")
-        fng_df = fng.fetch(["CRYPTO_FNG"], start, end)
-        result["fear_greed_rows"] = len(fng_df)
-
-    return result
-
-
-def _build_features_from_raw(calendar_start: str, calendar_end: str) -> Dict[str, Any]:
-    calendar = create_month_end_calendar(calendar_start, calendar_end)
-    raw_paths = _collect_raw_paths(series_list=None, include_fx=True, include_fng=True)
-    if not raw_paths:
-        raise RuntimeError("No raw inputs found. Run ingest first.")
-
-    master_panel = build_master_panel(raw_paths, calendar)
-    vintage_panel = apply_publication_delays(master_panel, PUBLICATION_RULES)
-
-    PROCESSED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    vintage_panel.to_parquet(PROCESSED_PATH)
-
-    features = build_feature_panel(vintage_panel)
-    FEATURES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    features.to_parquet(FEATURES_PATH)
-
-    targets_rows = 0
-    if "SP500" in vintage_panel.columns:
-        targets = compute_forward_returns(vintage_panel[["SP500"]], "SP500")
-        TARGETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        save_targets(targets, TARGETS_PATH)
-        targets_rows = len(targets)
-
-    return {
-        "master_shape": master_panel.shape,
-        "feature_shape": features.shape,
-        "targets_rows": targets_rows,
-    }
-
-
-def _train_from_files(
-    horizons: List[str],
-    quantiles: List[float],
-    alpha: float,
-    snapshot: Optional[str],
-) -> Dict[str, Any]:
-    if not FEATURES_PATH.exists() or not TARGETS_PATH.exists():
-        raise RuntimeError("features/targets artifacts are missing. Run feature build first.")
-
-    features = pd.read_parquet(FEATURES_PATH)
-    targets = pd.read_parquet(TARGETS_PATH)
-    aligned = align_targets_with_features(targets, features)
-
-    target_cols = [f"return_{h}" for h in horizons if f"return_{h}" in aligned.columns]
-    if not target_cols:
-        raise RuntimeError("No matching target columns for selected horizons.")
-
-    feature_cols = [
-        col
-        for col in aligned.columns
-        if not col.startswith("return_") and not col.endswith("_is_avail")
-    ]
-    if not feature_cols:
-        raise RuntimeError("No feature columns available for training.")
-
-    x_data = aligned[feature_cols]
-    y_data = aligned[target_cols]
-
-    models = train_models(
-        x_data,
-        y_data,
-        horizons=horizons,
-        quantiles=quantiles,
-        config={"alpha": alpha, "solver": "highs"},
+    chart = features.dropna(subset=["close"]).iloc[-lookback:]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=chart.index,
+            y=chart["upper"],
+            name="Upper",
+            line={"color": "#d97706", "width": 1},
+        )
     )
-    if not models:
-        raise RuntimeError("Training produced no models.")
-
-    snapshot_id = snapshot or datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = MODELS_DIR / snapshot_id / "models.pkl"
-    save_models(models, model_path)
-
-    return {
-        "snapshot": snapshot_id,
-        "path": str(model_path),
-        "trained_horizons": sorted(models.keys()),
-        "n_rows": len(x_data),
-    }
-
-
-def _resolve_snapshot(snapshot: Optional[str]) -> Tuple[str, Path]:
-    if snapshot and snapshot != "(none)":
-        snapshot_id = snapshot
-    else:
-        latest = _latest_snapshot()
-        if not latest:
-            raise RuntimeError("No model snapshot found.")
-        snapshot_id = latest
-
-    model_path = MODELS_DIR / snapshot_id / "models.pkl"
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    return snapshot_id, model_path
-
-
-def _validate_from_files(
-    snapshot: Optional[str],
-    train_window: int,
-    test_window: int,
-    step_size: int,
-    retrain_each_step: bool,
-) -> Dict[str, Any]:
-    if not FEATURES_PATH.exists() or not TARGETS_PATH.exists():
-        raise RuntimeError("features/targets artifacts are missing.")
-
-    snapshot_id, model_path = _resolve_snapshot(snapshot)
-    models = load_models(model_path)
-    if not models:
-        raise RuntimeError("Loaded model snapshot is empty.")
-
-    features = pd.read_parquet(FEATURES_PATH)
-    targets = pd.read_parquet(TARGETS_PATH)
-    aligned = align_targets_with_features(targets, features)
-
-    target_cols = [f"return_{h}" for h in models.keys() if f"return_{h}" in aligned.columns]
-    if not target_cols:
-        raise RuntimeError("No matching targets for loaded model horizons.")
-
-    feature_cols = [
-        col
-        for col in aligned.columns
-        if not col.startswith("return_") and not col.endswith("_is_avail")
-    ]
-
-    x_data = aligned[feature_cols]
-    y_data = aligned[target_cols]
-
-    total_len = len(x_data)
-    tw = min(train_window, max(12, total_len // 2))
-    vw = min(test_window, max(6, total_len - tw))
-    if tw + vw > total_len:
-        vw = max(6, total_len - tw)
-    if tw + vw > total_len:
-        raise RuntimeError("Not enough aligned rows for validation windows.")
-
-    any_model = next(iter(models.values()))
-    cfg = ValidationConfig(
-        horizons=list(models.keys()),
-        quantiles=any_model.quantiles,
-        retrain_each_step=retrain_each_step,
+    fig.add_trace(
+        go.Scatter(
+            x=chart.index,
+            y=chart["lower"],
+            name="Lower",
+            fill="tonexty",
+            fillcolor="rgba(37, 99, 235, 0.10)",
+            line={"color": "#d97706", "width": 1},
+        )
     )
-    results = run_rolling_validation(
-        models,
-        x_data,
-        y_data,
-        train_window=tw,
-        test_window=vw,
-        step_size=step_size,
-        config=cfg,
+    fig.add_trace(
+        go.Scatter(
+            x=chart.index,
+            y=chart["middle"],
+            name="20D SMA",
+            line={"color": "#64748b", "width": 1, "dash": "dash"},
+        )
     )
-    report = create_validation_report(results)
+    fig.add_trace(
+        go.Scatter(
+            x=chart.index,
+            y=chart["close"],
+            name="Close",
+            line={"color": "#2563eb", "width": 2},
+        )
+    )
+    fig.update_layout(
+        title=f"{ticker} Daily Bollinger Bands",
+        height=360,
+        margin={"l": 10, "r": 10, "t": 45, "b": 25},
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-    eval_dir = EVALUATIONS_DIR / snapshot_id
-    eval_dir.mkdir(parents=True, exist_ok=True)
-    report_path = eval_dir / "validation_report.json"
-    with report_path.open("w", encoding="utf-8") as file:
-        json.dump(report, file, indent=2, ensure_ascii=False, default=str)
 
-    return {"snapshot": snapshot_id, "report_path": str(report_path), "report": report}
+def _render_sentiment_card(title: str, payload: dict[str, object]) -> None:
+    score = payload.get("score", np.nan)
+    rating = str(payload.get("rating", ""))
+    if not payload.get("ok", False) or pd.isna(score):
+        st.metric(title, "N/A", help="외부 데이터 호출 실패 또는 응답 없음")
+        return
+    st.metric(title, f"{float(score):.0f}", rating)
 
 
-def _run_full_pipeline(
-    ingest_start: date,
-    ingest_end: date,
-    include_fx: bool,
-    include_fng: bool,
-    calendar_start: str,
-    calendar_end: str,
-    horizons: List[str],
-    quantiles: List[float],
-    alpha: float,
-) -> Dict[str, Any]:
-    ingest_stats = _ingest_data(ingest_start, ingest_end, include_fx=include_fx, include_fng=include_fng)
-    feature_stats = _build_features_from_raw(calendar_start=calendar_start, calendar_end=calendar_end)
-    train_stats = _train_from_files(horizons=horizons, quantiles=quantiles, alpha=alpha, snapshot=None)
-    return {
-        "ingest": ingest_stats,
-        "features": feature_stats,
-        "train": train_stats,
+def _build_feature_map(
+    market_data: dict[str, pd.DataFrame],
+    config: BollingerConfig,
+) -> dict[str, pd.DataFrame]:
+    features: dict[str, pd.DataFrame] = {}
+    for ticker, frame in market_data.items():
+        if frame is None or frame.empty:
+            features[ticker] = pd.DataFrame()
+            continue
+        try:
+            features[ticker] = compute_bollinger_features(frame, config)
+        except Exception:
+            features[ticker] = pd.DataFrame()
+    return features
+
+
+def _render_backtest_equity(equity: pd.DataFrame) -> None:
+    if equity.empty:
+        st.info("백테스트 지수화 수익률을 계산할 데이터가 부족합니다.")
+        return
+    fig = go.Figure()
+    for column in equity.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=equity.index,
+                y=equity[column],
+                mode="lines",
+                name=column,
+            )
+        )
+    fig.update_layout(
+        title="전략별 지수화 자산가치",
+        height=420,
+        margin={"l": 10, "r": 10, "t": 45, "b": 25},
+        hovermode="x unified",
+        yaxis_title="Initial = 1.0",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_metric_table(metrics: pd.DataFrame) -> None:
+    if metrics.empty:
+        st.info("백테스트 성과 지표를 계산할 데이터가 부족합니다.")
+        return
+    fmt = {
+        "CAGR": "{:.1%}",
+        "MDD": "{:.1%}",
+        "Vol": "{:.1%}",
+        "Sharpe": "{:.2f}",
+        "Worst 1M": "{:.1%}",
+        "Worst 3M": "{:.1%}",
+        "Worst 1Y": "{:.1%}",
+        "Recovery Days": "{:.0f}",
+        "Trades": "{:.0f}",
+        "Avg Turnover": "{:.1%}",
     }
+    st.dataframe(metrics.style.format(fmt, na_rep="-"), use_container_width=True, hide_index=True)
+
+
+def _render_signal_quality(report: pd.DataFrame) -> None:
+    if report.empty:
+        st.info("신호 품질 검증에 필요한 데이터가 부족합니다.")
+        return
+    fmt = {
+        "events": "{:.0f}",
+        "5D_avg": "{:.1%}",
+        "5D_win_rate": "{:.1%}",
+        "10D_avg": "{:.1%}",
+        "10D_win_rate": "{:.1%}",
+        "20D_avg": "{:.1%}",
+        "20D_win_rate": "{:.1%}",
+        "40D_avg": "{:.1%}",
+        "40D_win_rate": "{:.1%}",
+    }
+    st.dataframe(report.style.format(fmt, na_rep="-"), use_container_width=True, hide_index=True)
 
 
 def main() -> None:
-    tab_a, tab_b = create_dashboard_layout()
-
-    if "selected_snapshot" not in st.session_state:
-        st.session_state["selected_snapshot"] = _latest_snapshot() or "(none)"
+    st.set_page_config(
+        page_title="GLD/SIVR/UPRO 리밸런싱 매니저",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.title("GLD/SIVR/UPRO 리밸런싱 매니저")
 
     with st.sidebar:
-        st.header("Settings")
-        if st.button("Clear cache"):
+        st.header("Portfolio")
+        today = date.today()
+        start = st.date_input("가격 시작일", value=date(2010, 1, 1))
+        end = st.date_input("가격 종료일", value=today)
+        use_cache = st.checkbox("가격 캐시 사용", value=True)
+
+        st.subheader("현재 보유")
+        quantities = {
+            ticker: st.number_input(f"{ticker} 수량", min_value=0.0, value=0.0, step=1.0)
+            for ticker in PORTFOLIO_TICKERS
+        }
+        cash = st.number_input("현금", min_value=0.0, value=0.0, step=100.0)
+
+        st.subheader("목표 비중")
+        ratio_gld = st.number_input("GLD core ratio", min_value=0.0, value=2.0, step=0.5)
+        ratio_sivr = st.number_input("SIVR core ratio", min_value=0.0, value=1.0, step=0.5)
+        ratio_upro = st.number_input("UPRO core ratio", min_value=0.0, value=1.0, step=0.5)
+        tactical_weight = st.slider("UPRO 단타 슬리브", 0.0, 0.5, 0.20, 0.01)
+        currently_tactical = st.checkbox("현재 UPRO 단타 슬리브 보유 중", value=False)
+
+        st.subheader("신호 설정")
+        bb_window = st.number_input("Bollinger window", min_value=5, max_value=80, value=20, step=1)
+        bb_std = st.number_input("표준편차 배수", min_value=1.0, max_value=4.0, value=2.0, step=0.1)
+        adx_threshold = st.number_input(
+            "UPRO 단타 ADX 기준",
+            min_value=5.0,
+            max_value=50.0,
+            value=20.0,
+        )
+        min_trade_value = st.number_input("최소 주문 금액", min_value=0.0, value=100.0, step=50.0)
+        drift_tolerance = st.slider("리밸런싱 허용 drift", 0.0, 0.10, 0.01, 0.005)
+
+        st.subheader("백테스트")
+        initial_capital = st.number_input("초기 테스트 자산", min_value=1000.0, value=10_000.0)
+        transaction_cost_bps = st.number_input("거래비용 bps", min_value=0.0, value=5.0)
+        max_upro_weight = st.slider("백테스트 UPRO 최대비중", 0.10, 0.60, 0.35, 0.01)
+
+        if st.button("데이터 새로고침"):
             st.cache_data.clear()
-            st.success("Cache cleared.")
+            st.rerun()
 
-        use_live_features = st.checkbox("Use live features for Tab A", value=False)
-        live_start = st.text_input("Live start date", value="2000-01-01")
-        live_end = st.text_input("Live end date (blank=today)", value="")
+    if start >= end:
+        st.error("가격 시작일은 종료일보다 이전이어야 합니다.")
+        return
 
-        with st.expander("GUI Pipeline Runner", expanded=False):
-            ingest_start = st.date_input("Ingest start", value=date(2010, 1, 1), key="ingest_start")
-            ingest_end = st.date_input("Ingest end", value=date.today(), key="ingest_end")
-            include_fx = st.checkbox("Include FX", value=True, key="include_fx")
-            include_fng = st.checkbox("Include Fear&Greed", value=True, key="include_fng")
+    with st.spinner("시장 데이터 로딩 중..."):
+        market_data = _load_market_data(start, end, use_cache)
+        sentiment = _load_sentiment()
 
-            calendar_start = st.text_input("Calendar start", value="2010-01-01")
-            calendar_end = st.text_input("Calendar end (blank=today)", value="")
+    config = BollingerConfig(window=int(bb_window), num_std=float(bb_std))
+    features = _build_feature_map(market_data, config)
+    prices = {
+        ticker: _last_close(market_data.get(ticker, pd.DataFrame()))
+        for ticker in PORTFOLIO_TICKERS
+    }
 
-            horizons_text = st.text_input("Train horizons", value="1M,3M,6M,12M")
-            quantiles_text = st.text_input("Quantiles", value="0.05,0.10,0.25,0.50,0.75,0.90,0.95")
-            alpha = st.number_input("L1 alpha", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
+    tactical_signal = classify_upro_tactical_signal(
+        features.get("UPRO", pd.DataFrame()),
+        features.get("^GSPC", pd.DataFrame()),
+        features.get("^IXIC", pd.DataFrame()),
+        features.get("^VIX", pd.DataFrame()),
+        sleeve_weight=tactical_weight,
+        adx_threshold=float(adx_threshold),
+    )
+    tactical_active = tactical_signal["action"] == "ENTER" or (
+        currently_tactical and tactical_signal["action"] != "EXIT"
+    )
 
-            train_window = st.number_input("Validate train window", min_value=12, max_value=240, value=60, step=1)
-            test_window = st.number_input("Validate test window", min_value=6, max_value=120, value=12, step=1)
-            step_size = st.number_input("Validate step", min_value=1, max_value=24, value=1, step=1)
-            retrain_each_step = st.checkbox("Retrain each validation step", value=True)
+    orders = compute_rebalance_orders(
+        quantities=quantities,
+        cash=float(cash),
+        prices=prices,
+        core_ratio={"GLD": ratio_gld, "SIVR": ratio_sivr, "UPRO": ratio_upro},
+        tactical_weight=float(tactical_weight),
+        tactical_active=bool(tactical_active),
+        min_trade_value=float(min_trade_value),
+        drift_tolerance=float(drift_tolerance),
+    )
 
-            col_ingest, col_feature = st.columns(2)
-            col_train, col_validate = st.columns(2)
-            run_ingest = col_ingest.button("1) Ingest", use_container_width=True)
-            run_features = col_feature.button("2) Features", use_container_width=True)
-            run_train = col_train.button("3) Train", use_container_width=True)
-            run_validate = col_validate.button("4) Validate", use_container_width=True)
-            run_all = st.button("Run full pipeline (1->3)", type="primary", use_container_width=True)
+    total_value = float(orders["current_value"].sum())
+    invested_value = float(
+        orders.loc[orders["ticker"].isin(PORTFOLIO_TICKERS), "current_value"].sum()
+    )
 
-            calendar_end_effective = calendar_end.strip() or date.today().strftime("%Y-%m-%d")
-            horizons = _parse_csv_list(horizons_text)
+    overview_cols = st.columns(5)
+    overview_cols[0].metric("총자산", _format_money(total_value))
+    overview_cols[1].metric("투자금액", _format_money(invested_value))
+    overview_cols[2].metric(
+        "현금비중",
+        _format_pct(float(cash) / total_value if total_value > 0 else np.nan),
+    )
+    overview_cols[3].metric("UPRO 단타", str(tactical_signal.get("label", "-")))
+    overview_cols[4].metric("VIX", f"{_last_close(market_data.get('^VIX', pd.DataFrame())):.2f}")
 
-            if run_ingest:
-                with st.spinner("Running ingest..."):
-                    try:
-                        stats = _ingest_data(
-                            ingest_start,
-                            ingest_end,
-                            include_fx=include_fx,
-                            include_fng=include_fng,
-                        )
-                        st.success(
-                            f"Ingest done: FRED={stats['fred_rows']}, FX={stats['fx_rows']}, "
-                            f"FearGreed={stats['fear_greed_rows']}"
-                        )
-                        st.cache_data.clear()
-                    except Exception as exc:
-                        _safe_log("warning", "gui_ingest_failed", error=str(exc))
-                        st.error(f"Ingest failed: {exc}")
+    st.caption(
+        "신호는 주문 자동화가 아닌 리밸런싱 참고용입니다. UPRO는 일일 3배 목표 상품이라 "
+        "변동성과 보유기간에 따라 지수 누적수익률의 3배와 달라질 수 있습니다."
+    )
 
-            if run_features:
-                with st.spinner("Building feature artifacts..."):
-                    try:
-                        stats = _build_features_from_raw(
-                            calendar_start=calendar_start,
-                            calendar_end=calendar_end_effective,
-                        )
-                        st.success(
-                            f"Features done: master={stats['master_shape']}, "
-                            f"features={stats['feature_shape']}, targets_rows={stats['targets_rows']}"
-                        )
-                        st.cache_data.clear()
-                    except Exception as exc:
-                        _safe_log("warning", "gui_features_failed", error=str(exc))
-                        st.error(f"Feature build failed: {exc}")
+    tab_rebalance, tab_signals, tab_reference, tab_backtest = st.tabs(
+        ["리밸런싱", "Bollinger 신호", "참고 지표", "백테스트/신호검증"]
+    )
 
-            if run_train:
-                with st.spinner("Training models..."):
-                    try:
-                        quantiles = _parse_quantiles(quantiles_text)
-                        stats = _train_from_files(
-                            horizons=horizons,
-                            quantiles=quantiles,
-                            alpha=float(alpha),
-                            snapshot=None,
-                        )
-                        st.session_state["selected_snapshot"] = stats["snapshot"]
-                        st.success(
-                            f"Train done: snapshot={stats['snapshot']}, horizons={stats['trained_horizons']}"
-                        )
-                    except Exception as exc:
-                        _safe_log("warning", "gui_train_failed", error=str(exc))
-                        st.error(f"Training failed: {exc}")
-
-            if run_validate:
-                with st.spinner("Running validation..."):
-                    try:
-                        stats = _validate_from_files(
-                            snapshot=st.session_state.get("selected_snapshot"),
-                            train_window=int(train_window),
-                            test_window=int(test_window),
-                            step_size=int(step_size),
-                            retrain_each_step=retrain_each_step,
-                        )
-                        st.success(f"Validation done: {stats['report_path']}")
-                    except Exception as exc:
-                        _safe_log("warning", "gui_validate_failed", error=str(exc))
-                        st.error(f"Validation failed: {exc}")
-
-            if run_all:
-                with st.spinner("Running full pipeline..."):
-                    try:
-                        quantiles = _parse_quantiles(quantiles_text)
-                        stats = _run_full_pipeline(
-                            ingest_start=ingest_start,
-                            ingest_end=ingest_end,
-                            include_fx=include_fx,
-                            include_fng=include_fng,
-                            calendar_start=calendar_start,
-                            calendar_end=calendar_end_effective,
-                            horizons=horizons,
-                            quantiles=quantiles,
-                            alpha=float(alpha),
-                        )
-                        snapshot = stats["train"]["snapshot"]
-                        st.session_state["selected_snapshot"] = snapshot
-                        st.success(
-                            "Full pipeline done: "
-                            f"snapshot={snapshot}, "
-                            f"features={stats['features']['feature_shape']}"
-                        )
-                        st.cache_data.clear()
-                    except Exception as exc:
-                        _safe_log("warning", "gui_full_pipeline_failed", error=str(exc))
-                        st.error(f"Full pipeline failed: {exc}")
-
-        st.markdown("---")
-        snaps = _list_model_snapshots()
-        snapshot_options = ["(none)"] + snaps
-        if st.session_state["selected_snapshot"] not in snapshot_options:
-            st.session_state["selected_snapshot"] = "(none)"
-        snapshot = st.selectbox("Model snapshot", options=snapshot_options, key="selected_snapshot")
-
-        st.subheader("Scenario shocks")
-        shock_defs = {
-            "DGS10": st.slider("10Y UST (bp)", -100, 100, 0, key="shock_dgs10") / 100.0,
-            "DGS3MO": st.slider("3M UST (bp)", -100, 100, 0, key="shock_dgs3mo") / 100.0,
-            "VIXCLS": st.slider("VIX (pts)", -20, 20, 0, key="shock_vix"),
-            "DCOILWTICO": st.slider("WTI (USD)", -20, 20, 0, key="shock_wti"),
-            "GOLDAMGBD228NLBM": st.slider("Gold (USD/oz)", -200, 200, 0, key="shock_gold"),
-            "NFCI": st.slider("NFCI", -1.0, 1.0, 0.0, step=0.05, key="shock_nfci"),
-            "CPIAUCSL": st.slider("CPI surprise", -1.0, 1.0, 0.0, step=0.05, key="shock_cpi"),
-        }
-        preset = st.selectbox("Preset scenario", options=["(none)"] + list(DEFAULT_SCENARIOS.keys()))
-
-        st.caption(f"features.parquet: {'yes' if FEATURES_PATH.exists() else 'no'}")
-        st.caption(f"targets.parquet: {'yes' if TARGETS_PATH.exists() else 'no'}")
-        st.caption(f"latest snapshot: {_latest_snapshot() or '(none)'}")
-
-    features_file = _load_features()
-    features_live: Optional[pd.DataFrame] = None
-    if use_live_features:
-        try:
-            features_live = _build_live_features_for_tab_a(
-                start=live_start.strip() or "2000-01-01",
-                end=live_end.strip() or None,
+    with tab_rebalance:
+        st.subheader("권장 리밸런싱")
+        display = orders.copy()
+        money_cols = ["price", "current_value", "target_value", "drift_value", "trade_value"]
+        for col in money_cols:
+            display[col] = display[col].map(
+                lambda value: "-" if pd.isna(value) else f"${value:,.2f}"
             )
-        except Exception as exc:
-            _safe_log("warning", "live_feature_build_failed", error=str(exc))
-            st.sidebar.warning(f"Live feature build failed: {exc}")
+        display["target_weight"] = display["target_weight"].map(lambda value: f"{value:.1%}")
+        display["drift_pct"] = display["drift_pct"].map(lambda value: f"{value:.1%}")
+        display["quantity"] = display["quantity"].map(
+            lambda value: "-" if pd.isna(value) else f"{value:,.2f}"
+        )
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
-    features = features_live if features_live is not None else features_file
-    prices = _load_prices()
-    if prices is None and features is not None and "SP500" in features.columns:
-        prices = features[["SP500"]].dropna()
-    daily_sp500 = _load_daily_sp500()
+        st.markdown("#### UPRO 단타 슬리브")
+        st.info(str(tactical_signal.get("detail", "")))
 
-    with tab_a:
-        st.subheader("Macro condition summary")
-        if features is None:
-            st.warning("No feature data found. Run GUI pipeline step 2 (Features).")
-        else:
-            if features_live is not None:
-                st.caption("Data source: live fetch (cached 5 min)")
-            else:
-                st.caption("Data source: local features.parquet")
-
-            last_row = _select_feature_row(features)
-            score = float(last_row.get("MacroScore", 0.0))
-            momentum = (
-                float(last_row.filter(like="_d1_z").mean())
-                if any(last_row.index.str.endswith("_d1_z"))
-                else 0.0
-            )
-            acceleration = (
-                float(last_row.filter(like="_d2_z").mean())
-                if any(last_row.index.str.endswith("_d2_z"))
-                else 0.0
-            )
-            render_macro_score_tile(score, momentum, acceleration)
-
-            breadth = (
-                float(last_row.get("MacroBreadth_top50", np.nan))
-                if "MacroBreadth_top50" in features.columns
-                else np.nan
-            )
-            breadth_delta = (
-                float(last_row.get("MacroBreadth_top50_delta", 0.0))
-                if "MacroBreadth_top50_delta" in features.columns
-                else 0.0
-            )
-            if not np.isnan(breadth):
-                render_breadth_bar(breadth, breadth_delta, "top 50%")
-
-            regime_cols = [col for col in features.columns if col.startswith("Regime_")]
-            if regime_cols:
-                regimes = {col.replace("Regime_", ""): str(last_row.get(col)) for col in regime_cols}
-                render_regime_badges(regimes)
-
-            st.markdown("---")
-            st.subheader("Key indicators")
-            key_inds = [
-                "VIXCLS",
-                "DGS10",
-                "DGS3MO",
-                "TERM_SPREAD",
-                "NFCI",
-                "DCOILWTICO",
-                "GOLDAMGBD228NLBM",
-                "USDKRW",
-                "UNRATE",
-                "CPIAUCSL",
-                "CRYPTO_FNG",
-            ]
-            cols = st.columns(3)
-            for idx, indicator in enumerate(key_inds):
-                if indicator not in features.columns:
-                    continue
-                level = float(last_row.get(indicator, np.nan))
-                level_score = float(last_row.get(f"{indicator}_pctscore", np.nan))
-                mom = float(last_row.get(f"{indicator}_d1", np.nan))
-                acc = float(last_row.get(f"{indicator}_d2", np.nan))
-                pct = (level_score + 1.0) / 2.0 if not np.isnan(level_score) else np.nan
-                with cols[idx % 3]:
-                    render_indicator_card(indicator, level, level_score, mom, acc, pct)
-
-            changes: List[Dict[str, Any]] = []
-            if not np.isnan(breadth_delta) and abs(breadth_delta) >= 0.1:
-                changes.append(
-                    {
-                        "indicator": "MacroBreadth(top50)",
-                        "direction": "up" if breadth_delta > 0 else "down",
-                        "magnitude": breadth_delta * 100.0,
-                        "context": "breadth momentum",
-                    }
+    with tab_signals:
+        signal_cols = st.columns(3)
+        for idx, ticker in enumerate(PORTFOLIO_TICKERS):
+            frame = features.get(ticker, pd.DataFrame())
+            row = latest_signal_row(frame)
+            signal = classify_core_signal(row)
+            with signal_cols[idx]:
+                price = prices.get(ticker, np.nan)
+                st.metric(
+                    ticker,
+                    f"${price:,.2f}" if not pd.isna(price) else "-",
+                    f"%B {float(row['pct_b']):.2f}" if row is not None else "-",
                 )
-            render_auto_summary(changes)
+                _render_signal_badge(signal)
 
-            st.markdown("---")
-            st.subheader("Indicator narratives")
-            render_indicator_narratives(key_inds, last_row)
+        for ticker in PORTFOLIO_TICKERS:
+            _render_bollinger_chart(ticker, features.get(ticker, pd.DataFrame()))
 
-            with st.expander("AI one-liner (optional)"):
-                use_ai = st.checkbox(
-                    "Use Gemini summary",
-                    value=False,
-                    help="Requires GEMINI_API_KEY or GOOGLE_API_KEY.",
-                )
-                if use_ai:
-                    render_ai_one_liner(last_row, key_inds)
+    with tab_reference:
+        st.subheader("시장 참고 지표")
+        ref_cols = st.columns(5)
+        ref_cols[0].metric(
+            "UPRO 5D",
+            _format_pct(_price_delta(market_data.get("UPRO", pd.DataFrame()))),
+        )
+        ref_cols[1].metric(
+            "S&P500 5D",
+            _format_pct(_price_delta(market_data.get("^GSPC", pd.DataFrame()))),
+        )
+        ref_cols[2].metric(
+            "NASDAQ 5D",
+            _format_pct(_price_delta(market_data.get("^IXIC", pd.DataFrame()))),
+        )
+        with ref_cols[3]:
+            _render_sentiment_card("CNN F&G", sentiment["cnn"])
+        with ref_cols[4]:
+            _render_sentiment_card("Crypto F&G", sentiment["crypto"])
 
-    with tab_b:
-        st.subheader("S&P 500 fan chart")
-        if snapshot == "(none)":
-            st.warning("No model snapshot selected. Run GUI pipeline step 3 (Train).")
+        ref_table_rows = []
+        for ticker in ["UPRO", *REFERENCE_TICKERS]:
+            frame = features.get(ticker, pd.DataFrame())
+            row = latest_signal_row(frame)
+            ref_table_rows.append(
+                {
+                    "name": TICKER_LABELS.get(ticker, ticker),
+                    "close": _last_close(market_data.get(ticker, pd.DataFrame())),
+                    "5d_return": _price_delta(market_data.get(ticker, pd.DataFrame())),
+                    "pct_b": float(row["pct_b"]) if row is not None else np.nan,
+                    "adx": float(row.get("adx", np.nan)) if row is not None else np.nan,
+                }
+            )
+        ref_df = pd.DataFrame(ref_table_rows)
+        st.dataframe(
+            ref_df.style.format(
+                {
+                    "close": "${:,.2f}",
+                    "5d_return": "{:.1%}",
+                    "pct_b": "{:.2f}",
+                    "adx": "{:.1f}",
+                },
+                na_rep="-",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        for ticker in REFERENCE_TICKERS:
+            _render_bollinger_chart(
+                TICKER_LABELS.get(ticker, ticker),
+                features.get(ticker, pd.DataFrame()),
+            )
+
+    with tab_backtest:
+        st.subheader("코어-새틀라이트 자동 검증")
+        st.caption(
+            "목표는 최적 파라미터 탐색이 아니라 2:1:1 리밸런싱, 볼린저 평균회귀, "
+            "UPRO 추세추종 위성이 어떤 손실 구조를 갖는지 비교하는 것입니다."
+        )
+        price_panel = close_panel(market_data)
+        if price_panel.empty:
+            st.warning("백테스트에 사용할 가격 패널이 없습니다.")
             return
 
-        model_path = MODELS_DIR / snapshot / "models.pkl"
-        if not model_path.exists():
-            st.error(f"Model file not found: {model_path}")
-            return
+        bt_config = BacktestConfig(
+            initial_capital=float(initial_capital),
+            core_weights=(0.50, 0.25, 0.25),
+            rebalance_band=float(drift_tolerance),
+            transaction_cost_bps=float(transaction_cost_bps),
+            satellite_weight=float(tactical_weight),
+            satellite_unit_weight=0.05,
+            max_upro_weight=float(max_upro_weight),
+            min_cash_weight=0.05,
+            bb_window=int(bb_window),
+            bb_std=float(bb_std),
+        )
+        metrics, equity, _ = run_backtest_suite(price_panel, bt_config)
+        _render_metric_table(metrics)
+        _render_backtest_equity(equity)
 
-        if features is None or prices is None:
-            st.warning("Missing features or prices. Run GUI pipeline step 2 (Features).")
-            return
-
-        try:
-            models = load_models(model_path)
-        except Exception as exc:
-            st.error(f"Model load failed: {exc}")
-            return
-
-        if not models:
-            st.warning("Snapshot contains no trained model.")
-            return
-
-        x_t = _select_feature_row(features)
-        custom_shocks = {key: value for key, value in shock_defs.items() if value != 0}
-        shocks = _normalize_shocks(custom_shocks)
-
-        if preset != "(none)" and preset in DEFAULT_SCENARIOS:
-            preset_shocks = DEFAULT_SCENARIOS[preset].get("shocks", {})
-            shocks.update(_normalize_shocks(preset_shocks))
-
-        x_shocked = apply_shocks(x_t, shocks) if shocks else x_t
-        current_price = float(prices.iloc[-1]["SP500"]) if not prices.empty else 0.0
-        vix_val = float(x_shocked.get("VIXCLS", x_t.get("VIXCLS", 20.0)))
-
-        fancharts = predict_fanchart(models, x_shocked, vix_current=vix_val)
-        if not fancharts:
-            st.warning("No fan chart result. Check model and feature inputs.")
-            return
-
-        keys = list(fancharts.keys())
-        default_index = keys.index("1M") if "1M" in keys else 0
-        horizon = st.selectbox("Horizon", options=keys, index=default_index)
-        render_fan_chart(fancharts[horizon], prices, current_price, show_history=True)
-
-        if daily_sp500 is not None and len(daily_sp500) >= 30:
-            st.markdown("---")
-            st.subheader("Daily Bollinger Bands")
-            render_bollinger_bands(daily_sp500, window=20, num_std=2.0)
-
-        quantiles = fancharts[horizon]["quantiles"]
-        if all(key in quantiles for key in ("q10", "q90")):
-            iqr_width = float(quantiles["q90"][0] - quantiles["q10"][0])
-            historical_avg = 0.0
-            if len(prices) > 24:
-                returns = np.log(prices["SP500"]).diff(21).dropna()
-                historical_avg = float(returns.rolling(24).std().dropna().mean() * 2)
-            historical_avg = historical_avg or max(iqr_width, 1e-3)
-            render_uncertainty_gauge(iqr_width, historical_avg)
-
-        if horizon in models:
-            delta = (x_shocked - x_t).fillna(0.0)
-            contrib = compute_contributions(models[horizon], delta, quantile=0.5)
-            if not contrib.empty:
-                render_contribution_chart(contrib, top_n=5)
-
-        normalized_defaults = {
-            name: {**cfg, "shocks": _normalize_shocks(cfg.get("shocks", {}))}
-            for name, cfg in DEFAULT_SCENARIOS.items()
-        }
-        with st.expander("Preset scenario comparison", expanded=False):
-            try:
-                comparison_df = create_scenario_comparison(
-                    models,
-                    x_t,
-                    normalized_defaults,
-                    horizons=keys,
-                )
-                if isinstance(comparison_df, pd.DataFrame) and not comparison_df.empty:
-                    render_scenario_comparison(comparison_df)
-                else:
-                    st.info("No scenario comparison result.")
-            except Exception as exc:
-                st.info(f"Scenario comparison failed: {exc}")
+        st.markdown("#### Bollinger 신호 이후 수익률")
+        signal_report = signal_quality_report(price_panel, bt_config)
+        _render_signal_quality(signal_report)
 
 
 if __name__ == "__main__":
