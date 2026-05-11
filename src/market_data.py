@@ -124,9 +124,13 @@ def fetch_yfinance_prices(
                 ticker,
                 start=start_date.isoformat(),
                 end=(end_date + timedelta(days=1)).isoformat(),
+                interval="1d",
                 progress=False,
                 auto_adjust=False,
+                actions=True,
+                repair=True,
                 threads=False,
+                multi_level_index=False,
             )
             normalized = normalize_yfinance_frame(downloaded)
             _save_cached_price(cache_dir, ticker, normalized)

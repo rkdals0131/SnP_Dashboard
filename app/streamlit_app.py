@@ -34,8 +34,14 @@ if str(ROOT) not in sys.path:
 from src.backtesting import (  # noqa: E402
     BacktestConfig,
     close_panel,
+    cost_sensitivity_report,
+    out_of_sample_report,
+    parameter_sensitivity_report,
+    regime_report,
     run_backtest_suite,
     signal_quality_report,
+    stress_period_report,
+    walk_forward_report,
 )
 from src.market_data import (  # noqa: E402
     DEFAULT_PRICE_TICKERS,
@@ -77,15 +83,20 @@ def _load_sentiment() -> dict[str, dict[str, object]]:
 
 
 def _last_close(frame: pd.DataFrame) -> float:
-    if frame is None or frame.empty or "close" not in frame:
+    if frame is None or frame.empty or "close" not in frame.columns:
         return float("nan")
-    return float(frame["close"].dropna().iloc[-1])
+    close = pd.to_numeric(frame["close"], errors="coerce").dropna()
+    if close.empty:
+        return float("nan")
+    return float(close.iloc[-1])
 
 
 def _price_delta(frame: pd.DataFrame, periods: int = 5) -> float:
-    if frame is None or len(frame.dropna(subset=["close"])) <= periods:
+    if frame is None or frame.empty or "close" not in frame.columns:
         return float("nan")
-    close = frame["close"].dropna()
+    close = pd.to_numeric(frame["close"], errors="coerce").dropna()
+    if len(close) <= periods:
+        return float("nan")
     return float(close.iloc[-1] / close.iloc[-periods - 1] - 1.0)
 
 
@@ -256,6 +267,34 @@ def _render_signal_quality(report: pd.DataFrame) -> None:
     st.dataframe(report.style.format(fmt, na_rep="-"), use_container_width=True, hide_index=True)
 
 
+def _render_analysis_table(frame: pd.DataFrame) -> None:
+    if frame.empty:
+        st.info("표시할 분석 결과가 없습니다.")
+        return
+    fmt = {
+        "CAGR": "{:.1%}",
+        "MDD": "{:.1%}",
+        "Vol": "{:.1%}",
+        "Sharpe": "{:.2f}",
+        "Worst 1M": "{:.1%}",
+        "Worst 3M": "{:.1%}",
+        "Worst 1Y": "{:.1%}",
+        "Recovery Days": "{:.0f}",
+        "Trades": "{:.0f}",
+        "Avg Turnover": "{:.1%}",
+        "ann_return": "{:.1%}",
+        "ann_vol": "{:.1%}",
+        "hit_rate": "{:.1%}",
+        "worst_day": "{:.1%}",
+    }
+    available_fmt = {key: value for key, value in fmt.items() if key in frame.columns}
+    st.dataframe(
+        frame.style.format(available_fmt, na_rep="-"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="GLD/SIVR/UPRO 리밸런싱 매니저",
@@ -301,6 +340,8 @@ def main() -> None:
         initial_capital = st.number_input("초기 테스트 자산", min_value=1000.0, value=10_000.0)
         transaction_cost_bps = st.number_input("거래비용 bps", min_value=0.0, value=5.0)
         max_upro_weight = st.slider("백테스트 UPRO 최대비중", 0.10, 0.60, 0.35, 0.01)
+        max_hold_days = st.number_input("위성 최대 보유일", min_value=1, max_value=60, value=7)
+        oos_split = st.text_input("OOS split date", value="2021-01-01")
 
         if st.button("데이터 새로고침"):
             st.cache_data.clear()
@@ -333,16 +374,25 @@ def main() -> None:
         currently_tactical and tactical_signal["action"] != "EXIT"
     )
 
-    orders = compute_rebalance_orders(
-        quantities=quantities,
-        cash=float(cash),
-        prices=prices,
-        core_ratio={"GLD": ratio_gld, "SIVR": ratio_sivr, "UPRO": ratio_upro},
-        tactical_weight=float(tactical_weight),
-        tactical_active=bool(tactical_active),
-        min_trade_value=float(min_trade_value),
-        drift_tolerance=float(drift_tolerance),
-    )
+    try:
+        orders = compute_rebalance_orders(
+            quantities=quantities,
+            cash=float(cash),
+            prices=prices,
+            core_ratio={"GLD": ratio_gld, "SIVR": ratio_sivr, "UPRO": ratio_upro},
+            tactical_weight=float(tactical_weight),
+            tactical_active=bool(tactical_active),
+            min_trade_value=float(min_trade_value),
+            drift_tolerance=float(drift_tolerance),
+            transaction_cost_bps=float(transaction_cost_bps),
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        st.warning(
+            "보유수량이 있는 종목의 가격 데이터가 복구된 뒤 "
+            "리밸런싱 계산을 다시 실행하세요."
+        )
+        return
 
     total_value = float(orders["current_value"].sum())
     invested_value = float(
@@ -371,16 +421,32 @@ def main() -> None:
     with tab_rebalance:
         st.subheader("권장 리밸런싱")
         display = orders.copy()
-        money_cols = ["price", "current_value", "target_value", "drift_value", "trade_value"]
+        money_cols = [
+            "price",
+            "current_value",
+            "target_value",
+            "drift_value",
+            "trade_value",
+            "post_value",
+            "residual_drift",
+            "cash_from_sells",
+            "cash_used_for_buys",
+            "estimated_fee",
+            "post_trade_cash",
+        ]
         for col in money_cols:
-            display[col] = display[col].map(
-                lambda value: "-" if pd.isna(value) else f"${value:,.2f}"
-            )
-        display["target_weight"] = display["target_weight"].map(lambda value: f"{value:.1%}")
-        display["drift_pct"] = display["drift_pct"].map(lambda value: f"{value:.1%}")
-        display["quantity"] = display["quantity"].map(
-            lambda value: "-" if pd.isna(value) else f"{value:,.2f}"
-        )
+            if col in display.columns:
+                display[col] = display[col].map(
+                    lambda value: "-" if pd.isna(value) else f"${value:,.2f}"
+                )
+        for col in ["target_weight", "drift_pct", "post_weight"]:
+            if col in display.columns:
+                display[col] = display[col].map(lambda value: f"{value:.1%}")
+        for col in ["quantity", "post_qty"]:
+            if col in display.columns:
+                display[col] = display[col].map(
+                    lambda value: "-" if pd.isna(value) else f"{value:,.2f}"
+                )
         st.dataframe(display, use_container_width=True, hide_index=True)
 
         st.markdown("#### UPRO 단타 슬리브")
@@ -480,14 +546,52 @@ def main() -> None:
             min_cash_weight=0.05,
             bb_window=int(bb_window),
             bb_std=float(bb_std),
+            max_satellite_hold_days=int(max_hold_days),
         )
-        metrics, equity, _ = run_backtest_suite(price_panel, bt_config)
-        _render_metric_table(metrics)
-        _render_backtest_equity(equity)
-
-        st.markdown("#### Bollinger 신호 이후 수익률")
-        signal_report = signal_quality_report(price_panel, bt_config)
-        _render_signal_quality(signal_report)
+        bt_tabs = st.tabs(
+            [
+                "기본",
+                "신호품질",
+                "OOS",
+                "워크포워드",
+                "민감도/비용",
+                "레짐/스트레스",
+            ]
+        )
+        with bt_tabs[0]:
+            metrics, equity, _ = run_backtest_suite(price_panel, bt_config)
+            _render_metric_table(metrics)
+            _render_backtest_equity(equity)
+        with bt_tabs[1]:
+            signal_report = signal_quality_report(price_panel, bt_config)
+            _render_signal_quality(signal_report)
+        with bt_tabs[2]:
+            _render_analysis_table(out_of_sample_report(price_panel, oos_split, bt_config))
+        with bt_tabs[3]:
+            st.markdown("##### Rolling 5Y -> 1Y")
+            _render_analysis_table(
+                walk_forward_report(price_panel, bt_config, train_years=5, test_years=1)
+            )
+            st.markdown("##### Anchored -> 1Y")
+            _render_analysis_table(
+                walk_forward_report(
+                    price_panel,
+                    bt_config,
+                    train_years=5,
+                    test_years=1,
+                    anchored=True,
+                )
+            )
+        with bt_tabs[4]:
+            st.markdown("##### UPRO 추세추종 파라미터 민감도")
+            _render_analysis_table(parameter_sensitivity_report(price_panel, base_config=bt_config))
+            st.markdown("##### 거래비용/슬리피지 민감도")
+            _render_analysis_table(cost_sensitivity_report(price_panel, base_config=bt_config))
+        with bt_tabs[5]:
+            st.markdown("##### 레짐별 성과")
+            _render_analysis_table(regime_report(price_panel, config=bt_config))
+            st.markdown("##### 스트레스 구간")
+            _render_analysis_table(stress_period_report(price_panel, bt_config))
 
 
 if __name__ == "__main__":

@@ -284,11 +284,24 @@ def compute_rebalance_orders(
     tactical_active: bool = False,
     min_trade_value: float = 0.0,
     drift_tolerance: float = 0.0,
+    transaction_cost_bps: float = 0.0,
 ) -> pd.DataFrame:
     """Compute target values and integer ETF order suggestions."""
 
-    prices_clean = {ticker: max(float(prices.get(ticker, np.nan)), 0.0) for ticker in CORE_TICKERS}
     qty_clean = {ticker: float(quantities.get(ticker, 0.0)) for ticker in CORE_TICKERS}
+    prices_clean: dict[str, float] = {}
+    missing_held = []
+    for ticker in CORE_TICKERS:
+        price = float(prices.get(ticker, np.nan))
+        if not np.isfinite(price) or price <= 0:
+            if qty_clean[ticker] > 0:
+                missing_held.append(ticker)
+            price = np.nan
+        prices_clean[ticker] = price
+    if missing_held:
+        missing_text = ", ".join(missing_held)
+        raise ValueError(f"Missing valid prices for held positions: {missing_text}")
+
     current_values = {
         ticker: qty_clean[ticker] * prices_clean[ticker]
         for ticker in CORE_TICKERS
@@ -297,6 +310,7 @@ def compute_rebalance_orders(
     total_value = float(cash) + sum(current_values.values())
     targets = compute_target_weights(core_ratio, tactical_weight, tactical_active)
 
+    cost_rate = max(float(transaction_cost_bps), 0.0) / 10_000.0
     rows = []
     for ticker in CORE_TICKERS:
         price = prices_clean[ticker]
@@ -307,7 +321,8 @@ def compute_rebalance_orders(
         drift_pct = drift_value / total_value if total_value > 0 else 0.0
 
         should_trade = (
-            price > 0
+            np.isfinite(price)
+            and price > 0
             and abs(drift_value) >= float(min_trade_value)
             and abs(drift_pct) >= float(drift_tolerance)
         )
@@ -316,7 +331,7 @@ def compute_rebalance_orders(
             shares = int(np.sign(drift_value) * shares_abs)
         else:
             shares = 0
-        trade_value = shares * price
+        trade_value = shares * price if np.isfinite(price) else 0.0
 
         rows.append(
             {
@@ -334,6 +349,45 @@ def compute_rebalance_orders(
             }
         )
 
+    sell_proceeds = sum(abs(row["trade_value"]) for row in rows if row["shares"] < 0)
+    sell_fee = sell_proceeds * cost_rate
+    available_cash = max(float(cash) + sell_proceeds - sell_fee, 0.0)
+    buy_rows = sorted(
+        [row for row in rows if row["shares"] > 0],
+        key=lambda row: row["drift_value"],
+        reverse=True,
+    )
+    for row in buy_rows:
+        price = row["price"]
+        if not np.isfinite(price) or price <= 0:
+            row["shares"] = 0
+            row["trade_value"] = 0.0
+            row["action"] = "HOLD"
+            continue
+        max_affordable = int(np.floor(available_cash / (price * (1.0 + cost_rate))))
+        if row["shares"] > max_affordable:
+            row["shares"] = max_affordable
+            row["trade_value"] = row["shares"] * price
+            row["action"] = "BUY" if row["shares"] > 0 else "HOLD"
+        available_cash -= max(row["trade_value"], 0.0) * (1.0 + cost_rate)
+
+    cash_from_sells = sum(abs(row["trade_value"]) for row in rows if row["shares"] < 0)
+    cash_used_for_buys = sum(row["trade_value"] for row in rows if row["shares"] > 0)
+    estimated_fee = (cash_from_sells + cash_used_for_buys) * cost_rate
+    post_cash = float(cash) + cash_from_sells - cash_used_for_buys - estimated_fee
+    post_values = {}
+    for row in rows:
+        price = row["price"]
+        post_qty = row["quantity"] + row["shares"]
+        post_value = post_qty * price if np.isfinite(price) else 0.0
+        post_values[row["ticker"]] = post_value
+        row["post_qty"] = post_qty
+        row["post_value"] = post_value
+    post_total = post_cash + sum(post_values.values())
+    for row in rows:
+        row["post_weight"] = row["post_value"] / post_total if post_total > 0 else 0.0
+        row["residual_drift"] = row["target_value"] - row["post_value"]
+
     rows.append(
         {
             "ticker": "CASH",
@@ -350,6 +404,14 @@ def compute_rebalance_orders(
             ),
             "shares": 0,
             "trade_value": 0.0,
+            "post_qty": np.nan,
+            "post_value": post_cash,
+            "post_weight": post_cash / post_total if post_total > 0 else 0.0,
+            "residual_drift": total_value * targets["CASH"] - post_cash,
+            "cash_from_sells": cash_from_sells,
+            "cash_used_for_buys": cash_used_for_buys,
+            "estimated_fee": estimated_fee,
+            "post_trade_cash": post_cash,
             "action": "RESERVE",
         }
     )

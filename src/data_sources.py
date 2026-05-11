@@ -26,6 +26,23 @@ from structlog import get_logger
 logger = get_logger()
 
 
+def _cache_covers_range(
+    df: pd.DataFrame,
+    start: date,
+    end: date,
+    max_stale_days: int = 3,
+) -> bool:
+    """Return True when cached data broadly covers the requested date range."""
+
+    if df.empty:
+        return False
+    idx = pd.to_datetime(df.index)
+    min_date = idx.min().date()
+    max_date = idx.max().date()
+    stale_cutoff = end - pd.Timedelta(days=max_stale_days).to_pytimedelta()
+    return min_date <= start and max_date >= stale_cutoff
+
+
 class DataSource(Protocol):
     """데이터 소스 인터페이스 프로토콜"""
     name: str
@@ -202,7 +219,7 @@ class FREDSource:
             mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
             df_filtered = df[mask]
             
-            if len(df_filtered) > 0:
+            if len(df_filtered) > 0 and _cache_covers_range(df_filtered, start, end):
                 logger.info("캐시에서 로드", series_id=series_id, rows=len(df_filtered))
                 return df_filtered
                 
@@ -384,7 +401,12 @@ class FearGreedSource:
             df = pd.read_parquet(cache_file)
             mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
             df_filtered = df[mask]
-            if len(df_filtered) > 0:
+            if len(df_filtered) > 0 and _cache_covers_range(
+                df_filtered,
+                start,
+                end,
+                max_stale_days=1,
+            ):
                 logger.info("FearGreed 캐시에서 로드", series_id=series_id, rows=len(df_filtered))
                 return df_filtered
         except Exception as e:

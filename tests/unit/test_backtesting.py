@@ -1,13 +1,20 @@
 import numpy as np
 import pandas as pd
 
+import src.backtesting as backtesting_module
 from src.backtesting import (
     BacktestConfig,
     close_panel,
+    cost_sensitivity_report,
+    out_of_sample_report,
+    parameter_sensitivity_report,
     performance_metrics,
+    regime_report,
     run_backtest_suite,
     run_strategy_backtest,
     signal_quality_report,
+    stress_period_report,
+    walk_forward_report,
 )
 
 
@@ -46,6 +53,25 @@ def test_close_panel_aligns_available_prices():
     assert len(panel) == 30
 
 
+def test_close_panel_prefers_adjusted_close_for_backtests():
+    idx = pd.date_range("2024-01-01", periods=3, freq="B")
+    market_data = {
+        "SPY": pd.DataFrame(
+            {
+                "close": [100, 100, 100],
+                "adj_close": [90, 95, 100],
+            },
+            index=idx,
+        )
+    }
+
+    adjusted = close_panel(market_data, adjusted=True)
+    raw = close_panel(market_data, adjusted=False)
+
+    assert adjusted["SPY"].tolist() == [90, 95, 100]
+    assert raw["SPY"].tolist() == [100, 100, 100]
+
+
 def test_run_static_strategy_backtest_returns_equity_and_trades():
     panel = close_panel(_market_data())
     result = run_strategy_backtest(panel, "static_monthly", BacktestConfig())
@@ -81,3 +107,66 @@ def test_signal_quality_report_contains_event_rows():
 
     assert {"ticker", "signal", "events", "20D_avg"}.issubset(report.columns)
     assert set(report["ticker"]).issubset({"GLD", "SIVR", "UPRO"})
+
+
+def test_trend_following_tracks_tactical_state_column():
+    panel = close_panel(_market_data(420))
+    result = run_strategy_backtest(
+        panel,
+        "trend_following",
+        BacktestConfig(max_satellite_hold_days=7),
+    )
+    details = result["details"]
+
+    assert "tactical_active" in details.columns
+    assert set(details["tactical_active"].dropna().unique()).issubset({0.0, 1.0})
+
+
+def test_signal_based_backtest_uses_previous_day_signal(monkeypatch):
+    panel = close_panel(_market_data(80))
+    called_dates = []
+    original = backtesting_module._apply_mean_reversion_tilts
+
+    def recorder(base, features, signal_date, config, use_trend_filter):
+        called_dates.append(signal_date)
+        return original(base, features, signal_date, config, use_trend_filter)
+
+    monkeypatch.setattr(backtesting_module, "_apply_mean_reversion_tilts", recorder)
+
+    run_strategy_backtest(panel, "mean_reversion", BacktestConfig(bb_window=5))
+
+    assert called_dates
+    assert called_dates[0] == panel.dropna(subset=["GLD", "UPRO", "SIVR"]).index[0]
+
+
+def test_oos_walk_forward_and_sensitivity_reports_run():
+    panel = close_panel(_market_data(650))
+    config = BacktestConfig(bb_window=10, max_satellite_hold_days=5)
+
+    oos = out_of_sample_report(panel, "2021-08-01", config)
+    walk = walk_forward_report(panel, config, train_years=1, test_years=1)
+    sensitivity = parameter_sensitivity_report(
+        panel,
+        base_config=config,
+        windows=(10, 20),
+        stds=(2.0,),
+        hold_days=(5, 10),
+    )
+    costs = cost_sensitivity_report(panel, costs_bps=(0.0, 10.0), base_config=config)
+
+    assert {"segment", "strategy", "CAGR"}.issubset(oos.columns)
+    assert {"mode", "train_start", "test_end", "strategy"}.issubset(walk.columns)
+    assert {"bb_window", "bb_std", "max_hold_days"}.issubset(sensitivity.columns)
+    assert set(costs["cost_bps"]) == {0.0, 10.0}
+
+
+def test_regime_and_stress_reports_run():
+    panel = close_panel(_market_data(650))
+    config = BacktestConfig(bb_window=10)
+    stress_periods = {"sample": (str(panel.index[100].date()), str(panel.index[500].date()))}
+
+    regimes = regime_report(panel, config=config)
+    stress = stress_period_report(panel, config, stress_periods)
+
+    assert {"regime", "days", "ann_return"}.issubset(regimes.columns)
+    assert {"period", "strategy", "MDD"}.issubset(stress.columns)

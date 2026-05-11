@@ -21,6 +21,16 @@ StrategyName = Literal[
     "unlevered_monthly",
 ]
 
+STRESS_PERIODS = {
+    "2011 유럽 재정위기": ("2011-07-01", "2011-10-31"),
+    "2015-2016 원자재/위안화": ("2015-08-01", "2016-02-29"),
+    "2018 Q4 급락": ("2018-10-01", "2018-12-31"),
+    "2020 코로나 폭락": ("2020-02-15", "2020-04-30"),
+    "2022 금리 급등": ("2022-01-01", "2022-12-31"),
+    "2023 은행 위기": ("2023-03-01", "2023-05-31"),
+    "2024-2026 최근 구간": ("2024-01-01", "2026-12-31"),
+}
+
 
 @dataclass(frozen=True)
 class BacktestConfig:
@@ -34,16 +44,20 @@ class BacktestConfig:
     min_cash_weight: float = 0.05
     bb_window: int = 20
     bb_std: float = 2.0
+    max_satellite_hold_days: int = 7
 
 
-def close_panel(market_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def close_panel(market_data: dict[str, pd.DataFrame], adjusted: bool = True) -> pd.DataFrame:
     """Build an aligned close-price panel from normalized market data frames."""
 
     cols = {}
     for ticker, frame in market_data.items():
-        if frame is None or frame.empty or "close" not in frame.columns:
+        if frame is None or frame.empty:
             continue
-        series = pd.to_numeric(frame["close"], errors="coerce").rename(ticker)
+        price_col = "adj_close" if adjusted and "adj_close" in frame.columns else "close"
+        if price_col not in frame.columns:
+            continue
+        series = pd.to_numeric(frame[price_col], errors="coerce").rename(ticker)
         cols[ticker] = series
     if not cols:
         return pd.DataFrame()
@@ -162,19 +176,16 @@ def _apply_mean_reversion_tilts(
     return target
 
 
-def _trend_following_target(
-    base: pd.Series,
+def _trend_following_entry_exit(
     features: dict[str, pd.DataFrame],
     date: pd.Timestamp,
-    config: BacktestConfig,
-) -> pd.Series:
-    target = base * (1.0 - config.satellite_weight)
+) -> tuple[bool, bool]:
     upro = features.get("UPRO", pd.DataFrame())
     sp500 = features.get("^GSPC", features.get("SPY", pd.DataFrame()))
     nasdaq = features.get("^IXIC", pd.DataFrame())
     vix = features.get("^VIX", pd.DataFrame())
     if any(frame.empty or date not in frame.index for frame in [upro, sp500, nasdaq, vix]):
-        return target
+        return False, False
 
     upro_row = upro.loc[date]
     prior = upro.loc[:date].tail(2)
@@ -190,7 +201,29 @@ def _trend_following_target(
         and float(nasdaq.loc[date, "close"]) > float(nasdaq.loc[date, "middle"])
         and float(vix.loc[date, "close"]) <= float(vix.loc[date, "middle"])
     )
-    if trend_entry:
+    vix_clean = vix.loc[:date].dropna(subset=["close"])
+    previous_vix_close = float(vix_clean.iloc[-2]["close"]) if len(vix_clean) >= 2 else np.nan
+    vix_change = (
+        (float(vix.loc[date, "close"]) / previous_vix_close) - 1.0
+        if np.isfinite(previous_vix_close) and previous_vix_close > 0
+        else 0.0
+    )
+    trend_exit = bool(
+        float(upro_row["close"]) < float(upro_row.get("ema_5", np.nan))
+        or float(upro_row["close"]) < float(upro_row["middle"])
+        or float(vix.loc[date, "close"]) > float(vix.loc[date, "upper"])
+        or vix_change >= 0.10
+    )
+    return trend_entry, trend_exit
+
+
+def _trend_following_target(
+    base: pd.Series,
+    config: BacktestConfig,
+    in_tactical: bool,
+) -> pd.Series:
+    target = base * (1.0 - config.satellite_weight)
+    if in_tactical:
         target["UPRO"] = min(
             target.get("UPRO", 0.0) + config.satellite_weight,
             config.max_upro_weight,
@@ -233,6 +266,8 @@ def run_strategy_backtest(
     equity_rows = []
     trade_rows = []
     rebalance_days = _rebalance_mask(panel.index, spec["frequency"])
+    in_tactical = False
+    days_in_tactical = 0
 
     for idx, (day, row) in enumerate(panel.iterrows()):
         if idx > 0:
@@ -240,6 +275,7 @@ def run_strategy_backtest(
         else:
             total_value = cash
 
+        signal_day = panel.index[idx - 1] if idx > 0 else None
         target = pd.Series(0.0, index=panel.columns)
         kind = spec["kind"]
         if kind == "buy_hold":
@@ -250,12 +286,22 @@ def run_strategy_backtest(
             target.iloc[2] = 0.25
         else:
             target = _core_target_weights(config).reindex(panel.columns).fillna(0.0)
-            if kind == "mean_reversion":
-                target = _apply_mean_reversion_tilts(target, features, day, config, False)
-            elif kind == "mean_reversion_trend_filter":
-                target = _apply_mean_reversion_tilts(target, features, day, config, True)
+            if kind == "mean_reversion" and signal_day is not None:
+                target = _apply_mean_reversion_tilts(target, features, signal_day, config, False)
+            elif kind == "mean_reversion_trend_filter" and signal_day is not None:
+                target = _apply_mean_reversion_tilts(target, features, signal_day, config, True)
             elif kind == "trend_following":
-                target = _trend_following_target(target, features, day, config)
+                if signal_day is not None:
+                    entry, exit_ = _trend_following_entry_exit(features, signal_day)
+                    if not in_tactical and entry:
+                        in_tactical = True
+                        days_in_tactical = 0
+                    elif in_tactical:
+                        days_in_tactical += 1
+                        if exit_ or days_in_tactical >= config.max_satellite_hold_days:
+                            in_tactical = False
+                            days_in_tactical = 0
+                target = _trend_following_target(target, config, in_tactical)
 
         current_weights = (
             holdings.reindex(row.index).fillna(0.0) * row / total_value
@@ -281,6 +327,7 @@ def run_strategy_backtest(
                 "date": day,
                 "equity": total_value,
                 "cash": cash,
+                "tactical_active": float(in_tactical),
                 **{
                     f"{ticker}_weight": (
                         float(holdings.get(ticker, 0.0) * row[ticker] / total_value)
@@ -364,6 +411,233 @@ def run_backtest_suite(
     metrics = pd.DataFrame(metrics_rows)
     equity = pd.DataFrame(equity_cols).dropna(how="all")
     return metrics, equity, results
+
+
+def out_of_sample_report(
+    prices: pd.DataFrame,
+    split_date: str = "2021-01-01",
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Compare fixed-rule strategy metrics before and after a split date."""
+
+    config = config or BacktestConfig()
+    split = pd.Timestamp(split_date)
+    rows = []
+    for name, result in run_backtest_suite(prices, config)[2].items():
+        equity = result["equity"]
+        if not isinstance(equity, pd.Series) or equity.empty:
+            continue
+        for segment, segment_equity in {
+            f"before {split.date()}": equity[equity.index < split],
+            f"after {split.date()}": equity[equity.index >= split],
+        }.items():
+            if len(segment_equity) < 40:
+                continue
+            rows.append(
+                {
+                    "strategy_key": name,
+                    "strategy": str(result["label"]),
+                    "segment": segment,
+                    **performance_metrics(segment_equity),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def walk_forward_report(
+    prices: pd.DataFrame,
+    config: BacktestConfig | None = None,
+    train_years: int = 5,
+    test_years: int = 1,
+    anchored: bool = False,
+) -> pd.DataFrame:
+    """Run fixed-rule walk-forward windows and report next-window metrics."""
+
+    config = config or BacktestConfig()
+    if prices.empty:
+        return pd.DataFrame()
+
+    start = prices.dropna(how="all").index.min()
+    end = prices.dropna(how="all").index.max()
+    rows = []
+    train_start = start
+    while True:
+        train_end = train_start + pd.DateOffset(years=train_years)
+        test_end = train_end + pd.DateOffset(years=test_years)
+        if test_end > end + pd.Timedelta(days=1):
+            break
+        window_start = start if anchored else train_start
+        window_prices = prices.loc[window_start:test_end]
+        _, _, results = run_backtest_suite(window_prices, config)
+        for result in results.values():
+            equity = result["equity"]
+            if not isinstance(equity, pd.Series) or equity.empty:
+                continue
+            test_equity = equity[(equity.index > train_end) & (equity.index <= test_end)]
+            if len(test_equity) < 40:
+                continue
+            rows.append(
+                {
+                    "mode": "anchored" if anchored else "rolling",
+                    "train_start": window_start.date(),
+                    "train_end": train_end.date(),
+                    "test_start": (train_end + pd.Timedelta(days=1)).date(),
+                    "test_end": test_end.date(),
+                    "strategy": str(result["label"]),
+                    **performance_metrics(test_equity),
+                }
+            )
+        train_start = train_start + pd.DateOffset(years=test_years)
+    return pd.DataFrame(rows)
+
+
+def parameter_sensitivity_report(
+    prices: pd.DataFrame,
+    strategy: StrategyName = "trend_following",
+    windows: tuple[int, ...] = (10, 15, 20, 30, 40, 60),
+    stds: tuple[float, ...] = (1.5, 2.0, 2.5, 3.0),
+    hold_days: tuple[int, ...] = (5, 10, 20, 40),
+    base_config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Run a coarse robustness grid without selecting a single winner."""
+
+    base_config = base_config or BacktestConfig()
+    rows = []
+    for window in windows:
+        for std in stds:
+            for hold in hold_days:
+                config = BacktestConfig(
+                    initial_capital=base_config.initial_capital,
+                    core_weights=base_config.core_weights,
+                    rebalance_band=base_config.rebalance_band,
+                    transaction_cost_bps=base_config.transaction_cost_bps,
+                    satellite_weight=base_config.satellite_weight,
+                    satellite_unit_weight=base_config.satellite_unit_weight,
+                    max_upro_weight=base_config.max_upro_weight,
+                    min_cash_weight=base_config.min_cash_weight,
+                    bb_window=window,
+                    bb_std=std,
+                    max_satellite_hold_days=hold,
+                )
+                result = run_strategy_backtest(prices, strategy, config)
+                equity = result["equity"]
+                if not isinstance(equity, pd.Series) or equity.empty:
+                    continue
+                rows.append(
+                    {
+                        "strategy": str(result["label"]),
+                        "bb_window": window,
+                        "bb_std": std,
+                        "max_hold_days": hold,
+                        **performance_metrics(equity),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def cost_sensitivity_report(
+    prices: pd.DataFrame,
+    costs_bps: tuple[float, ...] = (0.0, 5.0, 10.0, 20.0, 50.0),
+    base_config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Show how strategy metrics change as trading costs/slippage rise."""
+
+    base_config = base_config or BacktestConfig()
+    rows = []
+    for cost in costs_bps:
+        config = BacktestConfig(
+            initial_capital=base_config.initial_capital,
+            core_weights=base_config.core_weights,
+            rebalance_band=base_config.rebalance_band,
+            transaction_cost_bps=cost,
+            satellite_weight=base_config.satellite_weight,
+            satellite_unit_weight=base_config.satellite_unit_weight,
+            max_upro_weight=base_config.max_upro_weight,
+            min_cash_weight=base_config.min_cash_weight,
+            bb_window=base_config.bb_window,
+            bb_std=base_config.bb_std,
+            max_satellite_hold_days=base_config.max_satellite_hold_days,
+        )
+        metrics, _, _ = run_backtest_suite(prices, config)
+        if metrics.empty:
+            continue
+        metrics = metrics.copy()
+        metrics.insert(0, "cost_bps", cost)
+        rows.append(metrics)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def regime_report(
+    prices: pd.DataFrame,
+    strategy: StrategyName = "trend_following",
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Summarize daily strategy returns under simple SPY/VIX/GLD regimes."""
+
+    config = config or BacktestConfig()
+    result = run_strategy_backtest(prices, strategy, config)
+    equity = result["equity"]
+    if not isinstance(equity, pd.Series) or equity.empty:
+        return pd.DataFrame()
+    returns = equity.pct_change().dropna()
+    spy_col = "SPY" if "SPY" in prices.columns else "^GSPC"
+    masks = {}
+    if spy_col in prices.columns:
+        spy = prices[spy_col].dropna()
+        spy_sma200 = spy.rolling(200, min_periods=120).mean()
+        masks["SPY > 200D"] = spy > spy_sma200
+        masks["SPY <= 200D"] = spy <= spy_sma200
+    if "^VIX" in prices.columns:
+        vix = prices["^VIX"].dropna()
+        masks["VIX > 20"] = vix > 20
+        masks["VIX <= 20"] = vix <= 20
+    if "GLD" in prices.columns:
+        gld = prices["GLD"].dropna()
+        gld_sma200 = gld.rolling(200, min_periods=120).mean()
+        masks["GLD > 200D"] = gld > gld_sma200
+        masks["GLD <= 200D"] = gld <= gld_sma200
+
+    rows = []
+    for name, mask in masks.items():
+        aligned_mask = mask.reindex(returns.index).fillna(False)
+        sample = returns[aligned_mask]
+        if sample.empty:
+            continue
+        rows.append(
+            {
+                "strategy": str(result["label"]),
+                "regime": name,
+                "days": float(len(sample)),
+                "ann_return": float(sample.mean() * 252),
+                "ann_vol": float(sample.std() * np.sqrt(252)),
+                "hit_rate": float((sample > 0).mean()),
+                "worst_day": float(sample.min()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def stress_period_report(
+    prices: pd.DataFrame,
+    config: BacktestConfig | None = None,
+    periods: dict[str, tuple[str, str]] | None = None,
+) -> pd.DataFrame:
+    """Run the default suite on named historical stress windows."""
+
+    config = config or BacktestConfig()
+    periods = periods or STRESS_PERIODS
+    rows = []
+    for name, (start, end) in periods.items():
+        period_prices = prices.loc[start:end]
+        if len(period_prices.dropna(how="all")) < 20:
+            continue
+        metrics, _, _ = run_backtest_suite(period_prices, config)
+        if metrics.empty:
+            continue
+        metrics = metrics.copy()
+        metrics.insert(0, "period", name)
+        rows.append(metrics)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
 def signal_quality_report(

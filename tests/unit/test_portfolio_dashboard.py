@@ -81,6 +81,35 @@ def test_compute_rebalance_orders_uses_integer_shares():
     assert gld["shares"] == 3
     assert sivr["shares"] == 4
     assert cash["target_weight"] == 0.20
+    assert "post_trade_cash" in orders.columns
+    assert cash["post_trade_cash"] >= 0
+
+
+def test_compute_rebalance_orders_blocks_missing_price_for_held_position():
+    with np.testing.assert_raises(ValueError):
+        compute_rebalance_orders(
+            quantities={"GLD": 1, "SIVR": 0, "UPRO": 0},
+            cash=100,
+            prices={"GLD": np.nan, "SIVR": 50, "UPRO": 40},
+        )
+
+
+def test_compute_rebalance_orders_scales_buys_to_available_cash():
+    orders = compute_rebalance_orders(
+        quantities={"GLD": 0, "SIVR": 0, "UPRO": 0},
+        cash=100,
+        prices={"GLD": 90, "SIVR": 50, "UPRO": 40},
+        core_ratio={"GLD": 2, "SIVR": 1, "UPRO": 1},
+        tactical_weight=0.0,
+        tactical_active=False,
+        min_trade_value=0,
+        drift_tolerance=0,
+        transaction_cost_bps=10,
+    )
+
+    cash = orders.set_index("ticker").loc["CASH"]
+    assert cash["post_trade_cash"] >= -1e-9
+    assert orders.loc[orders["ticker"].isin(["GLD", "SIVR", "UPRO"]), "trade_value"].sum() <= 100
 
 
 def test_upro_tactical_entry_signal_with_confirmations():
